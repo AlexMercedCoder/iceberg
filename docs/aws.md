@@ -393,9 +393,9 @@ We can then insert a single row into this new table
 INSERT INTO my_catalog.my_ns.my_table VALUES (1, "Pizza", "orders");
 ```
 
-Which will write the data to S3 with a hash (`2d3905f8`) appended directly after the `write.object-storage.path`, ensuring reads to the table are spread evenly  across [S3 bucket prefixes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html), and improving performance.
+Which will write the data to S3 with a hash (`2d3905f8`) appended directly before the partition folder, ensuring reads to the table are spread evenly  across [S3 bucket prefixes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html), and improving performance.
 ```
-s3://my-table-data-bucket/2d3905f8/my_ns.db/my_table/category=orders/00000-0-5affc076-96a4-48f2-9cd2-d5efbc9f0c94-00001.parquet
+s3://my-table-data-bucket/my_ns.db/my_table/2d3905f8/category=orders/00000-0-5affc076-96a4-48f2-9cd2-d5efbc9f0c94-00001.parquet
 ```
 
 Note, the path resolution logic for `ObjectStoreLocationProvider` is `write.data.path` then `<tableLocation>/data`.
