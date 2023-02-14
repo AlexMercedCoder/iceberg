@@ -18,12 +18,13 @@
  */
 package org.apache.iceberg.util;
 
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
-import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 
 public class PropertyUtil {
@@ -37,6 +38,14 @@ public class PropertyUtil {
       return Boolean.parseBoolean(value);
     }
     return defaultValue;
+  }
+
+  public static Boolean propertyAsNullableBoolean(Map<String, String> properties, String property) {
+    String value = properties.get(property);
+    if (value != null) {
+      return Boolean.parseBoolean(value);
+    }
+    return null;
   }
 
   public static double propertyAsDouble(
@@ -57,6 +66,14 @@ public class PropertyUtil {
     return defaultValue;
   }
 
+  public static Integer propertyAsNullableInt(Map<String, String> properties, String property) {
+    String value = properties.get(property);
+    if (value != null) {
+      return Integer.parseInt(value);
+    }
+    return null;
+  }
+
   public static long propertyAsLong(
       Map<String, String> properties, String property, long defaultValue) {
     String value = properties.get(property);
@@ -64,6 +81,14 @@ public class PropertyUtil {
       return Long.parseLong(value);
     }
     return defaultValue;
+  }
+
+  public static Long propertyAsNullableLong(Map<String, String> properties, String property) {
+    String value = properties.get(property);
+    if (value != null) {
+      return Long.parseLong(value);
+    }
+    return null;
   }
 
   public static String propertyAsString(
@@ -86,7 +111,7 @@ public class PropertyUtil {
   public static Map<String, String> propertiesWithPrefix(
       Map<String, String> properties, String prefix) {
     if (properties == null || properties.isEmpty()) {
-      return ImmutableMap.of();
+      return Collections.emptyMap();
     }
 
     Preconditions.checkArgument(prefix != null, "Invalid prefix: null");
@@ -94,6 +119,26 @@ public class PropertyUtil {
     return properties.entrySet().stream()
         .filter(e -> e.getKey().startsWith(prefix))
         .collect(Collectors.toMap(e -> e.getKey().replaceFirst(prefix, ""), Map.Entry::getValue));
+  }
+
+  /**
+   * Filter the properties map by the provided key predicate.
+   *
+   * @param properties input map
+   * @param keyPredicate predicate to choose keys from input map
+   * @return subset of input map with keys satisfying the predicate
+   */
+  public static Map<String, String> filterProperties(
+      Map<String, String> properties, Predicate<String> keyPredicate) {
+    if (properties == null || properties.isEmpty()) {
+      return Collections.emptyMap();
+    }
+
+    Preconditions.checkArgument(keyPredicate != null, "Invalid key pattern: null");
+
+    return properties.entrySet().stream()
+        .filter(e -> keyPredicate.test(e.getKey()))
+        .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
   }
 
   public static Map<String, String> applySchemaChanges(

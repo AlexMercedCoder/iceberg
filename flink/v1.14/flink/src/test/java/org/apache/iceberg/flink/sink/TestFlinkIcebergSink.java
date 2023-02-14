@@ -18,11 +18,9 @@
  */
 package org.apache.iceberg.flink.sink;
 
-import java.io.File;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.stream.Collectors;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
@@ -37,12 +35,16 @@ import org.apache.flink.types.Row;
 import org.apache.iceberg.AssertHelpers;
 import org.apache.iceberg.DistributionMode;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.flink.FlinkWriteOptions;
+import org.apache.iceberg.flink.HadoopCatalogResource;
 import org.apache.iceberg.flink.MiniClusterResource;
 import org.apache.iceberg.flink.SimpleDataUtil;
 import org.apache.iceberg.flink.TableLoader;
+import org.apache.iceberg.flink.TestFixtures;
 import org.apache.iceberg.flink.source.BoundedTestSource;
 import org.apache.iceberg.flink.util.FlinkCompatibilityUtil;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
@@ -51,6 +53,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.ClassRule;
+import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.junit.runner.RunWith;
@@ -65,12 +68,15 @@ public class TestFlinkIcebergSink {
 
   @ClassRule public static final TemporaryFolder TEMPORARY_FOLDER = new TemporaryFolder();
 
+  @Rule
+  public final HadoopCatalogResource catalogResource =
+      new HadoopCatalogResource(TEMPORARY_FOLDER, TestFixtures.DATABASE, TestFixtures.TABLE);
+
   private static final TypeInformation<Row> ROW_TYPE_INFO =
       new RowTypeInfo(SimpleDataUtil.FLINK_SCHEMA.getFieldTypes());
   private static final DataFormatConverters.RowConverter CONVERTER =
       new DataFormatConverters.RowConverter(SimpleDataUtil.FLINK_SCHEMA.getFieldDataTypes());
 
-  private String tablePath;
   private Table table;
   private StreamExecutionEnvironment env;
   private TableLoader tableLoader;
@@ -98,21 +104,23 @@ public class TestFlinkIcebergSink {
   }
 
   public TestFlinkIcebergSink(String format, int parallelism, boolean partitioned) {
-    this.format = FileFormat.valueOf(format.toUpperCase(Locale.ENGLISH));
+    this.format = FileFormat.fromString(format);
     this.parallelism = parallelism;
     this.partitioned = partitioned;
   }
 
   @Before
   public void before() throws IOException {
-    File folder = TEMPORARY_FOLDER.newFolder();
-    String warehouse = folder.getAbsolutePath();
-
-    tablePath = warehouse.concat("/test");
-    Assert.assertTrue("Should create the table path correctly.", new File(tablePath).mkdir());
-
-    Map<String, String> props = ImmutableMap.of(TableProperties.DEFAULT_FILE_FORMAT, format.name());
-    table = SimpleDataUtil.createTable(tablePath, props, partitioned);
+    table =
+        catalogResource
+            .catalog()
+            .createTable(
+                TestFixtures.TABLE_IDENTIFIER,
+                SimpleDataUtil.SCHEMA,
+                partitioned
+                    ? PartitionSpec.builderFor(SimpleDataUtil.SCHEMA).identity("data").build()
+                    : PartitionSpec.unpartitioned(),
+                ImmutableMap.of(TableProperties.DEFAULT_FILE_FORMAT, format.name()));
 
     env =
         StreamExecutionEnvironment.getExecutionEnvironment(
@@ -121,7 +129,7 @@ public class TestFlinkIcebergSink {
             .setParallelism(parallelism)
             .setMaxParallelism(parallelism);
 
-    tableLoader = TableLoader.fromHadoopTable(tablePath);
+    tableLoader = catalogResource.tableLoader();
   }
 
   private List<RowData> convertToRowData(List<Row> rows) {
@@ -149,7 +157,7 @@ public class TestFlinkIcebergSink {
     env.execute("Test Iceberg DataStream");
 
     // Assert the iceberg table's records.
-    SimpleDataUtil.assertTableRows(tablePath, convertToRowData(rows));
+    SimpleDataUtil.assertTableRows(table, convertToRowData(rows));
   }
 
   private List<Row> createRows(String prefix) {
@@ -181,7 +189,7 @@ public class TestFlinkIcebergSink {
     // Execute the program.
     env.execute("Test Iceberg DataStream.");
 
-    SimpleDataUtil.assertTableRows(tablePath, convertToRowData(rows));
+    SimpleDataUtil.assertTableRows(table, convertToRowData(rows));
   }
 
   private int partitionFiles(String partition) throws IOException {
@@ -281,15 +289,31 @@ public class TestFlinkIcebergSink {
   public void testTwoSinksInDisjointedDAG() throws Exception {
     Map<String, String> props = ImmutableMap.of(TableProperties.DEFAULT_FILE_FORMAT, format.name());
 
-    String leftTablePath = TEMPORARY_FOLDER.newFolder().getAbsolutePath().concat("/left");
-    Assert.assertTrue("Should create the table path correctly.", new File(leftTablePath).mkdir());
-    Table leftTable = SimpleDataUtil.createTable(leftTablePath, props, partitioned);
-    TableLoader leftTableLoader = TableLoader.fromHadoopTable(leftTablePath);
+    Table leftTable =
+        catalogResource
+            .catalog()
+            .createTable(
+                TableIdentifier.of("left"),
+                SimpleDataUtil.SCHEMA,
+                partitioned
+                    ? PartitionSpec.builderFor(SimpleDataUtil.SCHEMA).identity("data").build()
+                    : PartitionSpec.unpartitioned(),
+                props);
+    TableLoader leftTableLoader =
+        TableLoader.fromCatalog(catalogResource.catalogLoader(), TableIdentifier.of("left"));
 
-    String rightTablePath = TEMPORARY_FOLDER.newFolder().getAbsolutePath().concat("/right");
-    Assert.assertTrue("Should create the table path correctly.", new File(rightTablePath).mkdir());
-    Table rightTable = SimpleDataUtil.createTable(rightTablePath, props, partitioned);
-    TableLoader rightTableLoader = TableLoader.fromHadoopTable(rightTablePath);
+    Table rightTable =
+        catalogResource
+            .catalog()
+            .createTable(
+                TableIdentifier.of("right"),
+                SimpleDataUtil.SCHEMA,
+                partitioned
+                    ? PartitionSpec.builderFor(SimpleDataUtil.SCHEMA).identity("data").build()
+                    : PartitionSpec.unpartitioned(),
+                props);
+    TableLoader rightTableLoader =
+        TableLoader.fromCatalog(catalogResource.catalogLoader(), TableIdentifier.of("right"));
 
     env =
         StreamExecutionEnvironment.getExecutionEnvironment(
@@ -331,8 +355,8 @@ public class TestFlinkIcebergSink {
     // Execute the program.
     env.execute("Test Iceberg DataStream.");
 
-    SimpleDataUtil.assertTableRows(leftTablePath, convertToRowData(leftRows));
-    SimpleDataUtil.assertTableRows(rightTablePath, convertToRowData(rightRows));
+    SimpleDataUtil.assertTableRows(leftTable, convertToRowData(leftRows));
+    SimpleDataUtil.assertTableRows(rightTable, convertToRowData(rightRows));
 
     leftTable.refresh();
     Assert.assertNull(leftTable.currentSnapshot().summary().get("flink.test"));
@@ -362,7 +386,7 @@ public class TestFlinkIcebergSink {
     AssertHelpers.assertThrows(
         "Should fail with invalid distribution mode.",
         IllegalArgumentException.class,
-        "No enum constant org.apache.iceberg.DistributionMode.UNRECOGNIZED",
+        "Invalid distribution mode: UNRECOGNIZED",
         () -> {
           builder.append();
 
@@ -390,7 +414,7 @@ public class TestFlinkIcebergSink {
     AssertHelpers.assertThrows(
         "Should fail with invalid file format.",
         IllegalArgumentException.class,
-        "No enum constant org.apache.iceberg.FileFormat.UNRECOGNIZED",
+        "Invalid file format: UNRECOGNIZED",
         () -> {
           builder.append();
 

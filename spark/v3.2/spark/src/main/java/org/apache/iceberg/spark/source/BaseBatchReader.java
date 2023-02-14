@@ -20,7 +20,6 @@ package org.apache.iceberg.spark.source;
 
 import java.util.Map;
 import java.util.Set;
-import org.apache.arrow.vector.NullCheckingForGet;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.ScanTask;
@@ -79,13 +78,8 @@ abstract class BaseBatchReader<T extends ScanTask> extends BaseReader<ColumnarBa
       Expression residual,
       Map<Integer, ?> idToConstant,
       SparkDeleteFilter deleteFilter) {
-    // get required schema for filtering out equality-delete rows in case equality-delete uses
-    // columns are
-    // not selected.
-    Schema requiredSchema =
-        deleteFilter != null && deleteFilter.hasEqDeletes()
-            ? deleteFilter.requiredSchema()
-            : expectedSchema();
+    // get required schema if there are deletes
+    Schema requiredSchema = deleteFilter != null ? deleteFilter.requiredSchema() : expectedSchema();
 
     return Parquet.read(inputFile)
         .project(requiredSchema)
@@ -93,11 +87,7 @@ abstract class BaseBatchReader<T extends ScanTask> extends BaseReader<ColumnarBa
         .createBatchedReaderFunc(
             fileSchema ->
                 VectorizedSparkParquetReaders.buildReader(
-                    requiredSchema,
-                    fileSchema, /* setArrowValidityVector */
-                    NullCheckingForGet.NULL_CHECKING_ENABLED,
-                    idToConstant,
-                    deleteFilter))
+                    requiredSchema, fileSchema, idToConstant, deleteFilter))
         .recordsPerBatch(batchSize)
         .filter(residual)
         .caseSensitive(caseSensitive())

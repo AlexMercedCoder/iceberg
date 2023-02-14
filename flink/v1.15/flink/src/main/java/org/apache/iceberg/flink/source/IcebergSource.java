@@ -39,9 +39,13 @@ import org.apache.flink.core.io.SimpleVersionedSerializer;
 import org.apache.flink.table.api.TableSchema;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.util.Preconditions;
+import org.apache.iceberg.BaseMetadataTable;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.flink.FlinkConfigOptions;
+import org.apache.iceberg.flink.FlinkReadOptions;
 import org.apache.iceberg.flink.FlinkSchemaUtil;
 import org.apache.iceberg.flink.TableLoader;
 import org.apache.iceberg.flink.source.assigner.SplitAssigner;
@@ -54,10 +58,12 @@ import org.apache.iceberg.flink.source.enumerator.IcebergEnumeratorStateSerializ
 import org.apache.iceberg.flink.source.enumerator.StaticIcebergEnumerator;
 import org.apache.iceberg.flink.source.reader.IcebergSourceReader;
 import org.apache.iceberg.flink.source.reader.IcebergSourceReaderMetrics;
+import org.apache.iceberg.flink.source.reader.MetaDataReaderFunction;
 import org.apache.iceberg.flink.source.reader.ReaderFunction;
 import org.apache.iceberg.flink.source.reader.RowDataReaderFunction;
 import org.apache.iceberg.flink.source.split.IcebergSourceSplit;
 import org.apache.iceberg.flink.source.split.IcebergSourceSplitSerializer;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.util.ThreadPools;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -187,8 +193,7 @@ public class IcebergSource<T> implements Source<T, IcebergSourceSplit, IcebergEn
     } else {
       List<IcebergSourceSplit> splits = planSplitsForBatch(planningThreadName());
       assigner.onDiscoveredSplits(splits);
-      return new StaticIcebergEnumerator(
-          enumContext, assigner, lazyTable(), scanContext, enumState);
+      return new StaticIcebergEnumerator(enumContext, assigner);
     }
   }
 
@@ -201,22 +206,26 @@ public class IcebergSource<T> implements Source<T, IcebergSourceSplit, IcebergEn
   }
 
   public static class Builder<T> {
-
-    // required
     private TableLoader tableLoader;
+    private Table table;
     private SplitAssignerFactory splitAssignerFactory;
     private ReaderFunction<T> readerFunction;
     private ReadableConfig flinkConfig = new Configuration();
-
-    // optional
     private final ScanContext.Builder contextBuilder = ScanContext.builder();
     private TableSchema projectedFlinkSchema;
     private Boolean exposeLocality;
+
+    private final Map<String, String> readOptions = Maps.newHashMap();
 
     Builder() {}
 
     public Builder<T> tableLoader(TableLoader loader) {
       this.tableLoader = loader;
+      return this;
+    }
+
+    public Builder table(Table newTable) {
+      this.table = newTable;
       return this;
     }
 
@@ -235,119 +244,169 @@ public class IcebergSource<T> implements Source<T, IcebergSourceSplit, IcebergEn
       return this;
     }
 
-    public Builder caseSensitive(boolean newCaseSensitive) {
-      this.contextBuilder.caseSensitive(newCaseSensitive);
+    public Builder<T> caseSensitive(boolean newCaseSensitive) {
+      readOptions.put(FlinkReadOptions.CASE_SENSITIVE, Boolean.toString(newCaseSensitive));
       return this;
     }
 
-    public Builder useSnapshotId(Long newSnapshotId) {
-      this.contextBuilder.useSnapshotId(newSnapshotId);
+    public Builder<T> useSnapshotId(Long newSnapshotId) {
+      if (newSnapshotId != null) {
+        readOptions.put(FlinkReadOptions.SNAPSHOT_ID.key(), Long.toString(newSnapshotId));
+      }
       return this;
     }
 
-    public Builder streamingStartingStrategy(StreamingStartingStrategy newStartingStrategy) {
-      this.contextBuilder.startingStrategy(newStartingStrategy);
+    public Builder<T> streamingStartingStrategy(StreamingStartingStrategy newStartingStrategy) {
+      readOptions.put(FlinkReadOptions.STARTING_STRATEGY, newStartingStrategy.name());
       return this;
     }
 
-    public Builder startSnapshotTimestamp(Long newStartSnapshotTimestamp) {
-      this.contextBuilder.startSnapshotTimestamp(newStartSnapshotTimestamp);
+    public Builder<T> startSnapshotTimestamp(Long newStartSnapshotTimestamp) {
+      if (newStartSnapshotTimestamp != null) {
+        readOptions.put(
+            FlinkReadOptions.START_SNAPSHOT_TIMESTAMP.key(),
+            Long.toString(newStartSnapshotTimestamp));
+      }
       return this;
     }
 
-    public Builder startSnapshotId(Long newStartSnapshotId) {
-      this.contextBuilder.startSnapshotId(newStartSnapshotId);
+    public Builder<T> startSnapshotId(Long newStartSnapshotId) {
+      if (newStartSnapshotId != null) {
+        readOptions.put(
+            FlinkReadOptions.START_SNAPSHOT_ID.key(), Long.toString(newStartSnapshotId));
+      }
       return this;
     }
 
-    public Builder endSnapshotId(Long newEndSnapshotId) {
-      this.contextBuilder.endSnapshotId(newEndSnapshotId);
+    public Builder<T> endSnapshotId(Long newEndSnapshotId) {
+      if (newEndSnapshotId != null) {
+        readOptions.put(FlinkReadOptions.END_SNAPSHOT_ID.key(), Long.toString(newEndSnapshotId));
+      }
       return this;
     }
 
-    public Builder asOfTimestamp(Long newAsOfTimestamp) {
-      this.contextBuilder.asOfTimestamp(newAsOfTimestamp);
+    public Builder<T> asOfTimestamp(Long newAsOfTimestamp) {
+      if (newAsOfTimestamp != null) {
+        readOptions.put(FlinkReadOptions.AS_OF_TIMESTAMP.key(), Long.toString(newAsOfTimestamp));
+      }
       return this;
     }
 
-    public Builder splitSize(Long newSplitSize) {
-      this.contextBuilder.splitSize(newSplitSize);
+    public Builder<T> splitSize(Long newSplitSize) {
+      if (newSplitSize != null) {
+        readOptions.put(FlinkReadOptions.SPLIT_SIZE, Long.toString(newSplitSize));
+      }
       return this;
     }
 
-    public Builder splitLookback(Integer newSplitLookback) {
-      this.contextBuilder.splitLookback(newSplitLookback);
+    public Builder<T> splitLookback(Integer newSplitLookback) {
+      if (newSplitLookback != null) {
+        readOptions.put(FlinkReadOptions.SPLIT_LOOKBACK, Integer.toString(newSplitLookback));
+      }
       return this;
     }
 
-    public Builder splitOpenFileCost(Long newSplitOpenFileCost) {
-      this.contextBuilder.splitOpenFileCost(newSplitOpenFileCost);
+    public Builder<T> splitOpenFileCost(Long newSplitOpenFileCost) {
+      if (newSplitOpenFileCost != null) {
+        readOptions.put(FlinkReadOptions.SPLIT_FILE_OPEN_COST, Long.toString(newSplitOpenFileCost));
+      }
+
       return this;
     }
 
-    public Builder streaming(boolean streaming) {
-      this.contextBuilder.streaming(streaming);
+    public Builder<T> streaming(boolean streaming) {
+      readOptions.put(FlinkReadOptions.STREAMING, Boolean.toString(streaming));
       return this;
     }
 
-    public Builder monitorInterval(Duration newMonitorInterval) {
-      this.contextBuilder.monitorInterval(newMonitorInterval);
+    public Builder<T> monitorInterval(Duration newMonitorInterval) {
+      if (newMonitorInterval != null) {
+        readOptions.put(FlinkReadOptions.MONITOR_INTERVAL, newMonitorInterval.toNanos() + " ns");
+      }
       return this;
     }
 
-    public Builder nameMapping(String newNameMapping) {
-      this.contextBuilder.nameMapping(newNameMapping);
+    public Builder<T> nameMapping(String newNameMapping) {
+      readOptions.put(TableProperties.DEFAULT_NAME_MAPPING, newNameMapping);
       return this;
     }
 
-    public Builder project(Schema newProjectedSchema) {
+    public Builder<T> project(Schema newProjectedSchema) {
       this.contextBuilder.project(newProjectedSchema);
       return this;
     }
 
-    public Builder project(TableSchema newProjectedFlinkSchema) {
+    public Builder<T> project(TableSchema newProjectedFlinkSchema) {
       this.projectedFlinkSchema = newProjectedFlinkSchema;
       return this;
     }
 
-    public Builder filters(List<Expression> newFilters) {
+    public Builder<T> filters(List<Expression> newFilters) {
       this.contextBuilder.filters(newFilters);
       return this;
     }
 
-    public Builder limit(long newLimit) {
-      this.contextBuilder.limit(newLimit);
+    public Builder<T> limit(Long newLimit) {
+      if (newLimit != null) {
+        readOptions.put(FlinkReadOptions.LIMIT, Long.toString(newLimit));
+      }
       return this;
     }
 
-    public Builder includeColumnStats(boolean newIncludeColumnStats) {
-      this.contextBuilder.includeColumnStats(newIncludeColumnStats);
+    public Builder<T> includeColumnStats(boolean newIncludeColumnStats) {
+      readOptions.put(
+          FlinkReadOptions.INCLUDE_COLUMN_STATS, Boolean.toString(newIncludeColumnStats));
       return this;
     }
 
-    public Builder planParallelism(int planParallelism) {
-      this.contextBuilder.planParallelism(planParallelism);
+    public Builder<T> planParallelism(int planParallelism) {
+      readOptions.put(
+          FlinkConfigOptions.TABLE_EXEC_ICEBERG_WORKER_POOL_SIZE.key(),
+          Integer.toString(planParallelism));
       return this;
     }
 
-    public Builder exposeLocality(boolean newExposeLocality) {
+    public Builder<T> exposeLocality(boolean newExposeLocality) {
       this.exposeLocality = newExposeLocality;
       return this;
     }
 
-    public Builder properties(Map<String, String> properties) {
-      contextBuilder.fromProperties(properties);
+    /**
+     * Set the read properties for Flink source. View the supported properties in {@link
+     * FlinkReadOptions}
+     */
+    public Builder<T> set(String property, String value) {
+      readOptions.put(property, value);
+      return this;
+    }
+
+    /**
+     * Set the read properties for Flink source. View the supported properties in {@link
+     * FlinkReadOptions}
+     */
+    public Builder<T> setAll(Map<String, String> properties) {
+      readOptions.putAll(properties);
+      return this;
+    }
+
+    /** @deprecated Use {@link #setAll} instead. */
+    @Deprecated
+    public Builder<T> properties(Map<String, String> properties) {
+      readOptions.putAll(properties);
       return this;
     }
 
     public IcebergSource<T> build() {
-      Table table;
-      try (TableLoader loader = tableLoader) {
-        loader.open();
-        table = tableLoader.loadTable();
-      } catch (IOException e) {
-        throw new UncheckedIOException(e);
+      if (table == null) {
+        try (TableLoader loader = tableLoader) {
+          loader.open();
+          this.table = tableLoader.loadTable();
+        } catch (IOException e) {
+          throw new UncheckedIOException(e);
+        }
       }
+
+      contextBuilder.resolveConfig(table, readOptions, flinkConfig);
 
       Schema icebergSchema = table.schema();
       if (projectedFlinkSchema != null) {
@@ -356,16 +415,23 @@ public class IcebergSource<T> implements Source<T, IcebergSourceSplit, IcebergEn
 
       ScanContext context = contextBuilder.build();
       if (readerFunction == null) {
-        RowDataReaderFunction rowDataReaderFunction =
-            new RowDataReaderFunction(
-                flinkConfig,
-                table.schema(),
-                context.project(),
-                context.nameMapping(),
-                context.caseSensitive(),
-                table.io(),
-                table.encryption());
-        this.readerFunction = (ReaderFunction<T>) rowDataReaderFunction;
+        if (table instanceof BaseMetadataTable) {
+          MetaDataReaderFunction rowDataReaderFunction =
+              new MetaDataReaderFunction(
+                  flinkConfig, table.schema(), context.project(), table.io(), table.encryption());
+          this.readerFunction = (ReaderFunction<T>) rowDataReaderFunction;
+        } else {
+          RowDataReaderFunction rowDataReaderFunction =
+              new RowDataReaderFunction(
+                  flinkConfig,
+                  table.schema(),
+                  context.project(),
+                  context.nameMapping(),
+                  context.caseSensitive(),
+                  table.io(),
+                  table.encryption());
+          this.readerFunction = (ReaderFunction<T>) rowDataReaderFunction;
+        }
       }
 
       checkRequired();

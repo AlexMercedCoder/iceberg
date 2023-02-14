@@ -22,9 +22,12 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import org.apache.iceberg.BaseMetastoreTableOperations;
+import org.apache.iceberg.CatalogProperties;
+import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.LockManager;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.aws.AwsProperties;
+import org.apache.iceberg.aws.s3.S3FileIO;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.common.DynMethods;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
@@ -41,6 +44,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.awscore.exception.AwsServiceException;
 import software.amazon.awssdk.services.glue.GlueClient;
+import software.amazon.awssdk.services.glue.model.AccessDeniedException;
 import software.amazon.awssdk.services.glue.model.ConcurrentModificationException;
 import software.amazon.awssdk.services.glue.model.CreateTableRequest;
 import software.amazon.awssdk.services.glue.model.DeleteTableRequest;
@@ -67,8 +71,10 @@ class GlueTableOperations extends BaseMetastoreTableOperations {
   private final String tableName;
   private final String fullTableName;
   private final String commitLockEntityId;
-  private final FileIO fileIO;
+  private final Map<String, String> tableCatalogProperties;
+  private final Object hadoopConf;
   private final LockManager lockManager;
+  private FileIO fileIO;
 
   // Attempt to set versionId if available on the path
   private static final DynMethods.UnboundMethod SET_VERSION_ID =
@@ -83,7 +89,8 @@ class GlueTableOperations extends BaseMetastoreTableOperations {
       LockManager lockManager,
       String catalogName,
       AwsProperties awsProperties,
-      FileIO fileIO,
+      Map<String, String> tableCatalogProperties,
+      Object hadoopConf,
       TableIdentifier tableIdentifier) {
     this.glue = glue;
     this.awsProperties = awsProperties;
@@ -95,12 +102,16 @@ class GlueTableOperations extends BaseMetastoreTableOperations {
             tableIdentifier, awsProperties.glueCatalogSkipNameValidation());
     this.fullTableName = String.format("%s.%s.%s", catalogName, databaseName, tableName);
     this.commitLockEntityId = String.format("%s.%s", databaseName, tableName);
-    this.fileIO = fileIO;
+    this.tableCatalogProperties = tableCatalogProperties;
+    this.hadoopConf = hadoopConf;
     this.lockManager = lockManager;
   }
 
   @Override
   public FileIO io() {
+    if (fileIO == null) {
+      fileIO = initializeFileIO(this.tableCatalogProperties, this.hadoopConf);
+    }
     return fileIO;
   }
 
@@ -137,7 +148,8 @@ class GlueTableOperations extends BaseMetastoreTableOperations {
     try {
       glueTempTableCreated = createGlueTempTableIfNecessary(base, metadata.location());
 
-      newMetadataLocation = writeNewMetadata(metadata, currentVersion() + 1);
+      boolean newTable = base == null;
+      newMetadataLocation = writeNewMetadataIfRequired(newTable, metadata);
       lock(newMetadataLocation);
       Table glueTable = getGlueTable();
       checkMetadataLocation(glueTable, base);
@@ -157,7 +169,7 @@ class GlueTableOperations extends BaseMetastoreTableOperations {
     } catch (EntityNotFoundException e) {
       throw new NotFoundException(
           e, "Cannot commit %s because Glue cannot find the requested entity", tableName());
-    } catch (software.amazon.awssdk.services.glue.model.AccessDeniedException e) {
+    } catch (AccessDeniedException e) {
       throw new ForbiddenException(
           e, "Cannot commit %s because Glue cannot access the requested resources", tableName());
     } catch (software.amazon.awssdk.services.glue.model.ValidationException e) {
@@ -195,6 +207,17 @@ class GlueTableOperations extends BaseMetastoreTableOperations {
     } finally {
       cleanupMetadataAndUnlock(commitStatus, newMetadataLocation);
       cleanupGlueTempTableIfNecessary(glueTempTableCreated, commitStatus);
+    }
+  }
+
+  protected static FileIO initializeFileIO(Map<String, String> properties, Object hadoopConf) {
+    String fileIOImpl = properties.get(CatalogProperties.FILE_IO_IMPL);
+    if (fileIOImpl == null) {
+      FileIO io = new S3FileIO();
+      io.initialize(properties);
+      return io;
+    } else {
+      return CatalogUtil.loadFileIO(fileIOImpl, properties, hadoopConf);
     }
   }
 
@@ -333,5 +356,10 @@ class GlueTableOperations extends BaseMetastoreTableOperations {
         lockManager.release(commitLockEntityId, metadataLocation);
       }
     }
+  }
+
+  @VisibleForTesting
+  Map<String, String> tableCatalogProperties() {
+    return tableCatalogProperties;
   }
 }

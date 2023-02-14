@@ -56,8 +56,9 @@ import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.hadoop.Configurable;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.ResolvingFileIO;
-import org.apache.iceberg.metrics.LoggingScanReporter;
-import org.apache.iceberg.metrics.ScanReporter;
+import org.apache.iceberg.metrics.LoggingMetricsReporter;
+import org.apache.iceberg.metrics.MetricsReport;
+import org.apache.iceberg.metrics.MetricsReporter;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
@@ -67,6 +68,7 @@ import org.apache.iceberg.rest.auth.OAuth2Util.AuthSession;
 import org.apache.iceberg.rest.requests.CreateNamespaceRequest;
 import org.apache.iceberg.rest.requests.CreateTableRequest;
 import org.apache.iceberg.rest.requests.RenameTableRequest;
+import org.apache.iceberg.rest.requests.ReportMetricsRequest;
 import org.apache.iceberg.rest.requests.UpdateNamespacePropertiesRequest;
 import org.apache.iceberg.rest.responses.ConfigResponse;
 import org.apache.iceberg.rest.responses.CreateNamespaceResponse;
@@ -77,7 +79,6 @@ import org.apache.iceberg.rest.responses.LoadTableResponse;
 import org.apache.iceberg.rest.responses.OAuthTokenResponse;
 import org.apache.iceberg.rest.responses.UpdateNamespacePropertiesResponse;
 import org.apache.iceberg.util.EnvironmentUtil;
-import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.ThreadPools;
 import org.slf4j.Logger;
@@ -86,8 +87,7 @@ import org.slf4j.LoggerFactory;
 public class RESTSessionCatalog extends BaseSessionCatalog
     implements Configurable<Configuration>, Closeable {
   private static final Logger LOG = LoggerFactory.getLogger(RESTSessionCatalog.class);
-  private static final long MAX_REFRESH_WINDOW_MILLIS = 300_000; // 5 minutes
-  private static final long MIN_REFRESH_WAIT_MILLIS = 10;
+  private static final String REST_METRICS_REPORTING_ENABLED = "rest-metrics-reporting-enabled";
   private static final List<String> TOKEN_PREFERENCE_ORDER =
       ImmutableList.of(
           OAuth2Properties.ID_TOKEN_TYPE,
@@ -104,13 +104,14 @@ public class RESTSessionCatalog extends BaseSessionCatalog
   private ResourcePaths paths = null;
   private Object conf = null;
   private FileIO io = null;
-  private ScanReporter scanReporter = null;
+  private MetricsReporter reporter = null;
+  private boolean reportingViaRestEnabled;
 
   // a lazy thread pool for token refresh
   private volatile ScheduledExecutorService refreshExecutor = null;
 
   public RESTSessionCatalog() {
-    this(new HTTPClientFactory());
+    this(config -> HTTPClient.builder().uri(config.get(CatalogProperties.URI)).build());
   }
 
   RESTSessionCatalog(Function<Map<String, String>, RESTClient> clientBuilder) {
@@ -132,20 +133,19 @@ public class RESTSessionCatalog extends BaseSessionCatalog
     // fetch auth and config to complete initialization
     ConfigResponse config;
     OAuthTokenResponse authResponse;
+    String credential = props.get(OAuth2Properties.CREDENTIAL);
+    String scope = props.getOrDefault(OAuth2Properties.SCOPE, OAuth2Properties.CATALOG_SCOPE);
     try (RESTClient initClient = clientBuilder.apply(props)) {
       Map<String, String> initHeaders =
           RESTUtil.merge(configHeaders(props), OAuth2Util.authHeaders(initToken));
-      String credential = props.get(OAuth2Properties.CREDENTIAL);
       if (credential != null && !credential.isEmpty()) {
-        String scope = props.getOrDefault(OAuth2Properties.SCOPE, OAuth2Properties.CATALOG_SCOPE);
         authResponse = OAuth2Util.fetchToken(initClient, initHeaders, credential, scope);
-        config =
-            fetchConfig(
-                initClient,
-                RESTUtil.merge(initHeaders, OAuth2Util.authHeaders(authResponse.token())));
+        Map<String, String> authHeaders =
+            RESTUtil.merge(initHeaders, OAuth2Util.authHeaders(authResponse.token()));
+        config = fetchConfig(initClient, authHeaders, props);
       } else {
         authResponse = null;
-        config = fetchConfig(initClient, initHeaders);
+        config = fetchConfig(initClient, initHeaders, props);
       }
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to close HTTP client", e);
@@ -154,12 +154,6 @@ public class RESTSessionCatalog extends BaseSessionCatalog
     // build the final configuration and set up the catalog's auth
     Map<String, String> mergedProps = config.merge(props);
     Map<String, String> baseHeaders = configHeaders(mergedProps);
-    this.catalogAuth = new AuthSession(baseHeaders, null, null);
-    if (authResponse != null) {
-      this.catalogAuth = newSession(authResponse, startTimeMillis, catalogAuth);
-    } else if (initToken != null) {
-      this.catalogAuth = newSession(initToken, expiresInMs(mergedProps), catalogAuth);
-    }
 
     this.sessions = newSessionCache(mergedProps);
     this.refreshAuthByDefault =
@@ -170,19 +164,39 @@ public class RESTSessionCatalog extends BaseSessionCatalog
     this.client = clientBuilder.apply(mergedProps);
     this.paths = ResourcePaths.forCatalogProperties(mergedProps);
 
+    this.catalogAuth = new AuthSession(baseHeaders, null, null, credential, scope);
+    if (authResponse != null) {
+      this.catalogAuth =
+          AuthSession.fromTokenResponse(
+              client, tokenRefreshExecutor(), authResponse, startTimeMillis, catalogAuth);
+    } else if (initToken != null) {
+      this.catalogAuth =
+          AuthSession.fromAccessToken(
+              client, tokenRefreshExecutor(), initToken, expiresAtMillis(mergedProps), catalogAuth);
+    }
+
     String ioImpl = mergedProps.get(CatalogProperties.FILE_IO_IMPL);
     this.io =
         CatalogUtil.loadFileIO(
             ioImpl != null ? ioImpl : ResolvingFileIO.class.getName(), mergedProps, conf);
-    this.scanReporter = new LoggingScanReporter();
+    String metricsReporterImpl = mergedProps.get(CatalogProperties.METRICS_REPORTER_IMPL);
+    this.reporter =
+        null != metricsReporterImpl
+            ? CatalogUtil.loadMetricsReporter(metricsReporterImpl)
+            : LoggingMetricsReporter.instance();
 
+    this.reportingViaRestEnabled =
+        PropertyUtil.propertyAsBoolean(mergedProps, REST_METRICS_REPORTING_ENABLED, true);
     super.initialize(name, mergedProps);
   }
 
   private AuthSession session(SessionContext context) {
-    return sessions.get(
-        context.sessionId(),
-        id -> newSession(context.credentials(), context.properties(), catalogAuth));
+    AuthSession session =
+        sessions.get(
+            context.sessionId(),
+            id -> newSession(context.credentials(), context.properties(), catalogAuth));
+
+    return session != null ? session : catalogAuth;
   }
 
   private Supplier<Map<String, String>> headers(SessionContext context) {
@@ -221,8 +235,20 @@ public class RESTSessionCatalog extends BaseSessionCatalog
   }
 
   @Override
-  public boolean purgeTable(SessionContext context, TableIdentifier ident) {
-    throw new UnsupportedOperationException("Purge is not supported");
+  public boolean purgeTable(SessionContext context, TableIdentifier identifier) {
+    checkIdentifierIsValid(identifier);
+
+    try {
+      client.delete(
+          paths.table(identifier),
+          ImmutableMap.of("purgeRequested", "true"),
+          null,
+          headers(context),
+          ErrorHandlers.tableErrorHandler());
+      return true;
+    } catch (NoSuchTableException e) {
+      return false;
+    }
   }
 
   @Override
@@ -284,12 +310,36 @@ public class RESTSessionCatalog extends BaseSessionCatalog
             tableFileIO(response.config()),
             response.tableMetadata());
 
-    BaseTable table = new BaseTable(ops, fullTableName(loadedIdent), this.scanReporter);
+    TableIdentifier tableIdentifier = loadedIdent;
+    BaseTable table =
+        new BaseTable(
+            ops,
+            fullTableName(loadedIdent),
+            report -> reportMetrics(tableIdentifier, report, session::headers));
     if (metadataType != null) {
       return MetadataTableUtils.createMetadataTableInstance(table, metadataType);
     }
 
     return table;
+  }
+
+  private void reportMetrics(
+      TableIdentifier tableIdentifier,
+      MetricsReport report,
+      Supplier<Map<String, String>> headers) {
+    try {
+      reporter.report(report);
+      if (reportingViaRestEnabled) {
+        client.post(
+            paths.metrics(tableIdentifier),
+            ReportMetricsRequest.of(report),
+            null,
+            headers,
+            ErrorHandlers.defaultErrorHandler());
+      }
+    } catch (Exception e) {
+      LOG.warn("Failed to report metrics to REST endpoint for table {}", tableIdentifier, e);
+    }
   }
 
   @Override
@@ -398,34 +448,6 @@ public class RESTSessionCatalog extends BaseSessionCatalog
     }
 
     return refreshExecutor;
-  }
-
-  @SuppressWarnings("FutureReturnValueIgnored")
-  private void scheduleTokenRefresh(
-      AuthSession session, long startTimeMillis, long expiresIn, TimeUnit unit) {
-    // convert expiration interval to milliseconds
-    long expiresInMillis = unit.toMillis(expiresIn);
-    // how much ahead of time to start the request to allow it to complete
-    long refreshWindowMillis = Math.min(expiresInMillis / 10, MAX_REFRESH_WINDOW_MILLIS);
-    // how much time to wait before expiration
-    long waitIntervalMillis = expiresInMillis - refreshWindowMillis;
-    // how much time has already elapsed since the new token was issued
-    long elapsedMillis = System.currentTimeMillis() - startTimeMillis;
-    // how much time to actually wait
-    long timeToWait = Math.max(waitIntervalMillis - elapsedMillis, MIN_REFRESH_WAIT_MILLIS);
-
-    tokenRefreshExecutor()
-        .schedule(
-            () -> {
-              long refreshStartTime = System.currentTimeMillis();
-              Pair<Integer, TimeUnit> expiration = session.refresh(client);
-              if (expiration != null) {
-                scheduleTokenRefresh(
-                    session, refreshStartTime, expiration.first(), expiration.second());
-              }
-            },
-            timeToWait,
-            TimeUnit.MILLISECONDS);
   }
 
   @Override
@@ -560,7 +582,8 @@ public class RESTSessionCatalog extends BaseSessionCatalog
               createChanges(meta),
               meta);
 
-      return Transactions.createTableTransaction(fullName, ops, meta);
+      return Transactions.createTableTransaction(
+          fullName, ops, meta, report -> reportMetrics(ident, report, session::headers));
     }
 
     @Override
@@ -610,7 +633,8 @@ public class RESTSessionCatalog extends BaseSessionCatalog
               changes.build(),
               base);
 
-      return Transactions.replaceTableTransaction(fullName, ops, replacement);
+      return Transactions.replaceTableTransaction(
+          fullName, ops, replacement, report -> reportMetrics(ident, report, session::headers));
     }
 
     @Override
@@ -654,6 +678,7 @@ public class RESTSessionCatalog extends BaseSessionCatalog
   private static List<MetadataUpdate> createChanges(TableMetadata meta) {
     ImmutableList.Builder<MetadataUpdate> changes = ImmutableList.builder();
 
+    changes.add(new MetadataUpdate.AssignUUID(meta.uuid()));
     changes.add(new MetadataUpdate.UpgradeFormatVersion(meta.formatVersion()));
 
     Schema schema = meta.schema();
@@ -706,13 +731,29 @@ public class RESTSessionCatalog extends BaseSessionCatalog
   }
 
   private AuthSession tableSession(Map<String, String> tableConf, AuthSession parent) {
-    return newSession(tableConf, tableConf, parent);
+    AuthSession session = newSession(tableConf, tableConf, parent);
+
+    return session != null ? session : parent;
   }
 
-  private static ConfigResponse fetchConfig(RESTClient client, Map<String, String> headers) {
+  private static ConfigResponse fetchConfig(
+      RESTClient client, Map<String, String> headers, Map<String, String> properties) {
+    // send the client's warehouse location to the service to keep in sync
+    // this is needed for cases where the warehouse is configured client side, but may be used on
+    // the server side,
+    // like the Hive Metastore, where both client and service hive-site.xml may have a warehouse
+    // location.
+    ImmutableMap.Builder<String, String> queryParams = ImmutableMap.builder();
+    if (properties.containsKey(CatalogProperties.WAREHOUSE_LOCATION)) {
+      queryParams.put(
+          CatalogProperties.WAREHOUSE_LOCATION,
+          properties.get(CatalogProperties.WAREHOUSE_LOCATION));
+    }
+
     ConfigResponse configResponse =
         client.get(
             ResourcePaths.config(),
+            queryParams.build(),
             ConfigResponse.class,
             headers,
             ErrorHandlers.defaultErrorHandler());
@@ -725,72 +766,40 @@ public class RESTSessionCatalog extends BaseSessionCatalog
     if (credentials != null) {
       // use the bearer token without exchanging
       if (credentials.containsKey(OAuth2Properties.TOKEN)) {
-        return newSession(credentials.get(OAuth2Properties.TOKEN), expiresInMs(properties), parent);
+        return AuthSession.fromAccessToken(
+            client,
+            tokenRefreshExecutor(),
+            credentials.get(OAuth2Properties.TOKEN),
+            expiresAtMillis(properties),
+            parent);
       }
 
       if (credentials.containsKey(OAuth2Properties.CREDENTIAL)) {
         // fetch a token using the client credentials flow
-        return newSession(credentials.get(OAuth2Properties.CREDENTIAL), parent);
+        return AuthSession.fromCredential(
+            client, tokenRefreshExecutor(), credentials.get(OAuth2Properties.CREDENTIAL), parent);
       }
 
       for (String tokenType : TOKEN_PREFERENCE_ORDER) {
         if (credentials.containsKey(tokenType)) {
           // exchange the token for an access token using the token exchange flow
-          return newSession(credentials.get(tokenType), tokenType, parent);
+          return AuthSession.fromTokenExchange(
+              client, tokenRefreshExecutor(), credentials.get(tokenType), tokenType, parent);
         }
       }
     }
 
-    return parent;
+    return null;
   }
 
-  private AuthSession newSession(String token, Long expirationMs, AuthSession parent) {
-    AuthSession session =
-        new AuthSession(parent.headers(), token, OAuth2Properties.ACCESS_TOKEN_TYPE);
-    if (expirationMs != null) {
-      scheduleTokenRefresh(
-          session, System.currentTimeMillis(), expirationMs, TimeUnit.MILLISECONDS);
-    }
-    return session;
-  }
-
-  private AuthSession newSession(String token, String tokenType, AuthSession parent) {
-    long startTimeMillis = System.currentTimeMillis();
-    OAuthTokenResponse response =
-        OAuth2Util.exchangeToken(
-            client,
-            parent.headers(),
-            token,
-            tokenType,
-            parent.token(),
-            parent.tokenType(),
-            OAuth2Properties.CATALOG_SCOPE);
-    return newSession(response, startTimeMillis, parent);
-  }
-
-  private AuthSession newSession(String credential, AuthSession parent) {
-    long startTimeMillis = System.currentTimeMillis();
-    OAuthTokenResponse response =
-        OAuth2Util.fetchToken(client, parent.headers(), credential, OAuth2Properties.CATALOG_SCOPE);
-    return newSession(response, startTimeMillis, parent);
-  }
-
-  private AuthSession newSession(
-      OAuthTokenResponse response, long startTimeMillis, AuthSession parent) {
-    AuthSession session =
-        new AuthSession(parent.headers(), response.token(), response.issuedTokenType());
-    if (response.expiresInSeconds() != null) {
-      scheduleTokenRefresh(session, startTimeMillis, response.expiresInSeconds(), TimeUnit.SECONDS);
-    }
-    return session;
-  }
-
-  private Long expiresInMs(Map<String, String> properties) {
+  private Long expiresAtMillis(Map<String, String> properties) {
     if (refreshAuthByDefault || properties.containsKey(OAuth2Properties.TOKEN_EXPIRES_IN_MS)) {
-      return PropertyUtil.propertyAsLong(
-          properties,
-          OAuth2Properties.TOKEN_EXPIRES_IN_MS,
-          OAuth2Properties.TOKEN_EXPIRES_IN_MS_DEFAULT);
+      long expiresInMillis =
+          PropertyUtil.propertyAsLong(
+              properties,
+              OAuth2Properties.TOKEN_EXPIRES_IN_MS,
+              OAuth2Properties.TOKEN_EXPIRES_IN_MS_DEFAULT);
+      return System.currentTimeMillis() + expiresInMillis;
     } else {
       return null;
     }

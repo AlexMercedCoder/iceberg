@@ -37,7 +37,6 @@ import org.apache.iceberg.flink.source.StreamingStartingStrategy;
 import org.apache.iceberg.flink.source.split.IcebergSourceSplit;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
-import org.apache.iceberg.util.DateTimeUtil;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.ClassRule;
@@ -434,7 +433,7 @@ public class TestContinuousSplitPlannerImpl {
     AssertHelpers.assertThrows(
         "Should detect invalid starting snapshot timestamp",
         IllegalArgumentException.class,
-        "Cannot find a snapshot older than 1970-01-01T00:00:00.001+00:00",
+        "Cannot find a snapshot after: ",
         () -> splitPlanner.planSplits(null));
   }
 
@@ -442,9 +441,7 @@ public class TestContinuousSplitPlannerImpl {
   public void testIncrementalFromSnapshotTimestampWithInvalidIds() throws Exception {
     appendTwoSnapshots();
 
-    long invalidSnapshotTimestampMs = snapshot1.timestampMillis() - 1000L;
-    String invalidSnapshotTimestampMsStr =
-        DateTimeUtil.formatTimestampMillis(invalidSnapshotTimestampMs);
+    long invalidSnapshotTimestampMs = snapshot2.timestampMillis() + 1000L;
 
     ScanContext scanContextWithInvalidSnapshotId =
         ScanContext.builder()
@@ -459,7 +456,7 @@ public class TestContinuousSplitPlannerImpl {
     AssertHelpers.assertThrows(
         "Should detect invalid starting snapshot timestamp",
         IllegalArgumentException.class,
-        "Cannot find a snapshot older than " + invalidSnapshotTimestampMsStr,
+        "Cannot find a snapshot after: ",
         () -> splitPlanner.planSplits(null));
   }
 
@@ -506,5 +503,79 @@ public class TestContinuousSplitPlannerImpl {
     for (int i = 0; i < 3; ++i) {
       lastPosition = verifyOneCycle(splitPlanner, lastPosition);
     }
+  }
+
+  @Test
+  public void testMaxPlanningSnapshotCount() throws Exception {
+    appendTwoSnapshots();
+    // append 3 more snapshots
+    for (int i = 2; i < 5; ++i) {
+      appendSnapshot(i, 2);
+    }
+
+    ScanContext scanContext =
+        ScanContext.builder()
+            .startingStrategy(StreamingStartingStrategy.INCREMENTAL_FROM_EARLIEST_SNAPSHOT)
+            // limit to 1 snapshot per discovery
+            .maxPlanningSnapshotCount(1)
+            .build();
+    ContinuousSplitPlannerImpl splitPlanner =
+        new ContinuousSplitPlannerImpl(tableResource.table(), scanContext, null);
+
+    ContinuousEnumerationResult initialResult = splitPlanner.planSplits(null);
+    Assert.assertNull(initialResult.fromPosition());
+    // For inclusive behavior, the initial result should point to snapshot1's parent,
+    // which leads to null snapshotId and snapshotTimestampMs.
+    Assert.assertNull(initialResult.toPosition().snapshotId());
+    Assert.assertNull(initialResult.toPosition().snapshotTimestampMs());
+    Assert.assertEquals(0, initialResult.splits().size());
+
+    ContinuousEnumerationResult secondResult = splitPlanner.planSplits(initialResult.toPosition());
+    // should discover dataFile1 appended in snapshot1
+    verifyMaxPlanningSnapshotCountResult(
+        secondResult, null, snapshot1, ImmutableSet.of(dataFile1.path().toString()));
+
+    ContinuousEnumerationResult thirdResult = splitPlanner.planSplits(secondResult.toPosition());
+    // should discover dataFile2 appended in snapshot2
+    verifyMaxPlanningSnapshotCountResult(
+        thirdResult, snapshot1, snapshot2, ImmutableSet.of(dataFile2.path().toString()));
+  }
+
+  private void verifyMaxPlanningSnapshotCountResult(
+      ContinuousEnumerationResult result,
+      Snapshot fromSnapshotExclusive,
+      Snapshot toSnapshotInclusive,
+      Set<String> expectedFiles) {
+    if (fromSnapshotExclusive == null) {
+      Assert.assertNull(result.fromPosition().snapshotId());
+      Assert.assertNull(result.fromPosition().snapshotTimestampMs());
+    } else {
+      Assert.assertEquals(
+          fromSnapshotExclusive.snapshotId(), result.fromPosition().snapshotId().longValue());
+      Assert.assertEquals(
+          fromSnapshotExclusive.timestampMillis(),
+          result.fromPosition().snapshotTimestampMs().longValue());
+    }
+    Assert.assertEquals(
+        toSnapshotInclusive.snapshotId(), result.toPosition().snapshotId().longValue());
+    Assert.assertEquals(
+        toSnapshotInclusive.timestampMillis(),
+        result.toPosition().snapshotTimestampMs().longValue());
+    // should only have one split with one data file, because split discover is limited to
+    // one snapshot and each snapshot has only one data file appended.
+    IcebergSourceSplit split = Iterables.getOnlyElement(result.splits());
+    Assert.assertEquals(1, split.task().files().size());
+    Set<String> discoveredFiles =
+        split.task().files().stream()
+            .map(fileScanTask -> fileScanTask.file().path().toString())
+            .collect(Collectors.toSet());
+    Assert.assertEquals(expectedFiles, discoveredFiles);
+  }
+
+  private Snapshot appendSnapshot(long seed, int numRecords) throws Exception {
+    List<Record> batch = RandomGenericData.generate(TestFixtures.SCHEMA, numRecords, seed);
+    DataFile dataFile = dataAppender.writeFile(null, batch);
+    dataAppender.appendToTable(dataFile);
+    return tableResource.table().currentSnapshot();
   }
 }

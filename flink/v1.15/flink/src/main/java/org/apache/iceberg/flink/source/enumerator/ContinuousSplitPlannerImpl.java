@@ -32,6 +32,7 @@ import org.apache.iceberg.flink.source.FlinkSplitPlanner;
 import org.apache.iceberg.flink.source.ScanContext;
 import org.apache.iceberg.flink.source.StreamingStartingStrategy;
 import org.apache.iceberg.flink.source.split.IcebergSourceSplit;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.util.SnapshotUtil;
 import org.apache.iceberg.util.ThreadPools;
 import org.slf4j.Logger;
@@ -78,7 +79,22 @@ public class ContinuousSplitPlannerImpl implements ContinuousSplitPlanner {
     }
   }
 
-  /** Discover incremental changes between {@code lastPosition} and current table snapshot */
+  private Snapshot toSnapshotInclusive(
+      Long lastConsumedSnapshotId, Snapshot currentSnapshot, int maxPlanningSnapshotCount) {
+    // snapshots are in reverse order (latest snapshot first)
+    List<Snapshot> snapshots =
+        Lists.newArrayList(
+            SnapshotUtil.ancestorsBetween(
+                table, currentSnapshot.snapshotId(), lastConsumedSnapshotId));
+    if (snapshots.size() <= maxPlanningSnapshotCount) {
+      return currentSnapshot;
+    } else {
+      // Because snapshots are in reverse order of commit history, this index returns
+      // the max allowed number of snapshots from the lastConsumedSnapshotId.
+      return snapshots.get(snapshots.size() - maxPlanningSnapshotCount);
+    }
+  }
+
   private ContinuousEnumerationResult discoverIncrementalSplits(
       IcebergEnumeratorPosition lastPosition) {
     Snapshot currentSnapshot = table.currentSnapshot();
@@ -94,12 +110,16 @@ public class ContinuousSplitPlannerImpl implements ContinuousSplitPlanner {
       LOG.info("Current table snapshot is already enumerated: {}", currentSnapshot.snapshotId());
       return new ContinuousEnumerationResult(Collections.emptyList(), lastPosition, lastPosition);
     } else {
+      Long lastConsumedSnapshotId = lastPosition != null ? lastPosition.snapshotId() : null;
+      Snapshot toSnapshotInclusive =
+          toSnapshotInclusive(
+              lastConsumedSnapshotId, currentSnapshot, scanContext.maxPlanningSnapshotCount());
       IcebergEnumeratorPosition newPosition =
           IcebergEnumeratorPosition.of(
-              currentSnapshot.snapshotId(), currentSnapshot.timestampMillis());
+              toSnapshotInclusive.snapshotId(), toSnapshotInclusive.timestampMillis());
       ScanContext incrementalScan =
           scanContext.copyWithAppendsBetween(
-              lastPosition.snapshotId(), currentSnapshot.snapshotId());
+              lastPosition.snapshotId(), toSnapshotInclusive.snapshotId());
       List<IcebergSourceSplit> splits =
           FlinkSplitPlanner.planIcebergSourceSplits(table, incrementalScan, workerPool);
       LOG.info(
@@ -193,17 +213,12 @@ public class ContinuousSplitPlannerImpl implements ContinuousSplitPlanner {
             "Start snapshot id not found in history: " + scanContext.startSnapshotId());
         return Optional.of(matchedSnapshotById);
       case INCREMENTAL_FROM_SNAPSHOT_TIMESTAMP:
-        long snapshotIdAsOfTime =
-            SnapshotUtil.snapshotIdAsOfTime(table, scanContext.startSnapshotTimestamp());
-        Snapshot matchedSnapshotByTimestamp = table.snapshot(snapshotIdAsOfTime);
-        if (matchedSnapshotByTimestamp.timestampMillis() == scanContext.startSnapshotTimestamp()) {
-          return Optional.of(matchedSnapshotByTimestamp);
-        } else {
-          // if the snapshotIdAsOfTime has the timestamp value smaller than the
-          // scanContext.startSnapshotTimestamp(),
-          // return the child snapshot whose timestamp value is larger
-          return Optional.of(SnapshotUtil.snapshotAfter(table, snapshotIdAsOfTime));
-        }
+        Snapshot matchedSnapshotByTimestamp =
+            SnapshotUtil.oldestAncestorAfter(table, scanContext.startSnapshotTimestamp());
+        Preconditions.checkArgument(
+            matchedSnapshotByTimestamp != null,
+            "Cannot find a snapshot after: " + scanContext.startSnapshotTimestamp());
+        return Optional.of(matchedSnapshotByTimestamp);
       default:
         throw new IllegalArgumentException(
             "Unknown starting strategy: " + scanContext.streamingStartingStrategy());

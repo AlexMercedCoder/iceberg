@@ -43,7 +43,6 @@ import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.List;
-import java.util.Locale;
 import java.util.UUID;
 import org.apache.avro.generic.GenericData.Record;
 import org.apache.avro.generic.GenericRecordBuilder;
@@ -77,12 +76,12 @@ import org.apache.parquet.hadoop.ParquetFileReader;
 import org.apache.parquet.hadoop.metadata.BlockMetaData;
 import org.apache.parquet.io.DelegatingSeekableInputStream;
 import org.apache.parquet.schema.MessageType;
+import org.assertj.core.api.Assertions;
 import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
-import org.junit.rules.ExpectedException;
 import org.junit.rules.TemporaryFolder;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -98,7 +97,7 @@ public class TestMetricsRowGroupFilter {
   private final FileFormat format;
 
   public TestMetricsRowGroupFilter(String format) {
-    this.format = FileFormat.valueOf(format.toUpperCase(Locale.ENGLISH));
+    this.format = FileFormat.fromString(format);
   }
 
   private static final Types.StructType structFieldType =
@@ -121,7 +120,8 @@ public class TestMetricsRowGroupFilter {
               Types.MapType.ofRequired(12, 13, StringType.get(), IntegerType.get())),
           optional(14, "all_nans", DoubleType.get()),
           optional(15, "some_nans", FloatType.get()),
-          optional(16, "no_nans", DoubleType.get()));
+          optional(16, "no_nans", DoubleType.get()),
+          optional(17, "some_double_nans", DoubleType.get()));
 
   private static final Types.StructType _structFieldType =
       Types.StructType.of(Types.NestedField.required(8, "_int_field", IntegerType.get()));
@@ -138,7 +138,8 @@ public class TestMetricsRowGroupFilter {
           optional(10, "_str", StringType.get()),
           optional(14, "_all_nans", Types.DoubleType.get()),
           optional(15, "_some_nans", FloatType.get()),
-          optional(16, "_no_nans", Types.DoubleType.get()));
+          optional(16, "_no_nans", Types.DoubleType.get()),
+          optional(17, "_some_double_nans", Types.DoubleType.get()));
 
   private static final String TOO_LONG_FOR_STATS_PARQUET;
 
@@ -199,6 +200,8 @@ public class TestMetricsRowGroupFilter {
         record.setField("_str", i + "str" + i);
         record.setField("_all_nans", Double.NaN); // never non-nan
         record.setField("_some_nans", (i % 10 == 0) ? Float.NaN : 2F); // includes some nan values
+        record.setField(
+            "_some_double_nans", (i % 10 == 0) ? Double.NaN : 2D); // includes some nan values
         record.setField("_no_nans", 3D); // optional, but always non-nan
 
         GenericRecord structNotNull = GenericRecord.create(_structFieldType);
@@ -242,6 +245,8 @@ public class TestMetricsRowGroupFilter {
         builder.set("_no_nulls", ""); // optional, but always non-null
         builder.set("_all_nans", Double.NaN); // never non-nan
         builder.set("_some_nans", (i % 10 == 0) ? Float.NaN : 2F); // includes some nan values
+        builder.set(
+            "_some_double_nans", (i % 10 == 0) ? Double.NaN : 2D); // includes some nan values
         builder.set("_no_nans", 3D); // optional, but always non-nan
         builder.set("_str", i + "str" + i);
 
@@ -302,6 +307,43 @@ public class TestMetricsRowGroupFilter {
   }
 
   @Test
+  public void testFloatWithNan() {
+    // NaN's should break Parquet's Min/Max stats we should be reading in all cases
+    boolean shouldRead = shouldRead(greaterThan("some_nans", 1.0));
+    Assert.assertTrue(shouldRead);
+
+    shouldRead = shouldRead(greaterThanOrEqual("some_nans", 1.0));
+    Assert.assertTrue(shouldRead);
+
+    shouldRead = shouldRead(lessThan("some_nans", 3.0));
+    Assert.assertTrue(shouldRead);
+
+    shouldRead = shouldRead(lessThanOrEqual("some_nans", 1.0));
+    Assert.assertTrue(shouldRead);
+
+    shouldRead = shouldRead(equal("some_nans", 2.0));
+    Assert.assertTrue(shouldRead);
+  }
+
+  @Test
+  public void testDoubleWithNan() {
+    boolean shouldRead = shouldRead(greaterThan("some_double_nans", 1.0));
+    Assert.assertTrue("Should read: column with some nans contains target value", shouldRead);
+
+    shouldRead = shouldRead(greaterThanOrEqual("some_double_nans", 1.0));
+    Assert.assertTrue("Should read: column with some nans contains the target value", shouldRead);
+
+    shouldRead = shouldRead(lessThan("some_double_nans", 3.0));
+    Assert.assertTrue("Should read: column with some nans contains target value", shouldRead);
+
+    shouldRead = shouldRead(lessThanOrEqual("some_double_nans", 1.0));
+    Assert.assertTrue("Should read: column with some nans contains target value", shouldRead);
+
+    shouldRead = shouldRead(equal("some_double_nans", 2.0));
+    Assert.assertTrue("Should read: column with some nans contains target value", shouldRead);
+  }
+
+  @Test
   public void testIsNaN() {
     boolean shouldRead = shouldRead(isNaN("all_nans"));
     Assert.assertTrue("Should read: NaN counts are not tracked in Parquet metrics", shouldRead);
@@ -351,15 +393,12 @@ public class TestMetricsRowGroupFilter {
     Assert.assertFalse("Should skip: required columns are always non-null", shouldRead);
   }
 
-  @Rule public ExpectedException exceptionRule = ExpectedException.none();
-
   @Test
   public void testMissingColumn() {
-    exceptionRule.expect(ValidationException.class);
-    exceptionRule.expectMessage("Cannot find field 'missing'");
-    exceptionRule.reportMissingExceptionWithMessage(
-        "Should complain about missing column in expression");
-    shouldRead(lessThan("missing", 5));
+    Assertions.assertThatThrownBy(() -> shouldRead(lessThan("missing", 5)))
+        .as("Should complain about missing column in expression")
+        .isInstanceOf(ValidationException.class)
+        .hasMessageStartingWith("Cannot find field 'missing'");
   }
 
   @Test

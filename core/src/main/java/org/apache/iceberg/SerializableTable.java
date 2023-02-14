@@ -82,7 +82,7 @@ public class SerializableTable implements Table, Serializable {
     this.io = fileIO(table);
     this.encryption = table.encryption();
     this.locationProvider = table.locationProvider();
-    this.refs = table.refs();
+    this.refs = SerializableMap.copyOf(table.refs());
   }
 
   /**
@@ -238,6 +238,11 @@ public class SerializableTable implements Table, Serializable {
   }
 
   @Override
+  public List<StatisticsFile> statisticsFiles() {
+    return lazyTable().statisticsFiles();
+  }
+
+  @Override
   public Map<String, SnapshotRef> refs() {
     return refs;
   }
@@ -250,6 +255,11 @@ public class SerializableTable implements Table, Serializable {
   @Override
   public TableScan newScan() {
     return lazyTable().newScan();
+  }
+
+  @Override
+  public BatchScan newBatchScan() {
+    return lazyTable().newBatchScan();
   }
 
   @Override
@@ -333,13 +343,13 @@ public class SerializableTable implements Table, Serializable {
   }
 
   @Override
-  public ExpireSnapshots expireSnapshots() {
-    throw new UnsupportedOperationException(errorMsg("expireSnapshots"));
+  public UpdateStatistics updateStatistics() {
+    throw new UnsupportedOperationException(errorMsg("updateStatistics"));
   }
 
   @Override
-  public Rollback rollback() {
-    throw new UnsupportedOperationException(errorMsg("rollback"));
+  public ExpireSnapshots expireSnapshots() {
+    throw new UnsupportedOperationException(errorMsg("expireSnapshots"));
   }
 
   @Override
@@ -369,6 +379,10 @@ public class SerializableTable implements Table, Serializable {
     @Override
     protected Table newTable(TableOperations ops, String tableName) {
       return MetadataTableUtils.createMetadataTableInstance(ops, baseTableName, tableName, type);
+    }
+
+    public MetadataTableType type() {
+      return type;
     }
   }
 

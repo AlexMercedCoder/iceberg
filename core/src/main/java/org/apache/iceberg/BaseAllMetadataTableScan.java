@@ -34,23 +34,23 @@ import org.slf4j.LoggerFactory;
 abstract class BaseAllMetadataTableScan extends BaseMetadataTableScan {
   private static final Logger LOG = LoggerFactory.getLogger(BaseAllMetadataTableScan.class);
 
-  BaseAllMetadataTableScan(
-      TableOperations ops, Table table, Schema schema, MetadataTableType tableType) {
-    super(ops, table, schema, tableType);
+  BaseAllMetadataTableScan(Table table, Schema schema, MetadataTableType tableType) {
+    super(table, schema, tableType);
   }
 
   BaseAllMetadataTableScan(
-      TableOperations ops,
-      Table table,
-      Schema schema,
-      MetadataTableType tableType,
-      TableScanContext context) {
-    super(ops, table, schema, tableType, context);
+      Table table, Schema schema, MetadataTableType tableType, TableScanContext context) {
+    super(table, schema, tableType, context);
   }
 
   @Override
   public TableScan useSnapshot(long scanSnapshotId) {
     throw new UnsupportedOperationException("Cannot select snapshot in table: " + tableType());
+  }
+
+  @Override
+  public TableScan useRef(String ref) {
+    throw new UnsupportedOperationException("Cannot select ref in table: " + tableType());
   }
 
   @Override

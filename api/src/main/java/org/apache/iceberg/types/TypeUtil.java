@@ -142,9 +142,21 @@ public class TypeUtil {
   }
 
   public static Schema join(Schema left, Schema right) {
-    List<Types.NestedField> joinedColumns = Lists.newArrayList();
-    joinedColumns.addAll(left.columns());
-    joinedColumns.addAll(right.columns());
+    List<Types.NestedField> joinedColumns = Lists.newArrayList(left.columns());
+    for (Types.NestedField rightColumn : right.columns()) {
+      Types.NestedField leftColumn = left.findField(rightColumn.fieldId());
+
+      if (leftColumn == null) {
+        joinedColumns.add(rightColumn);
+      } else {
+        Preconditions.checkArgument(
+            leftColumn.equals(rightColumn),
+            "Schemas have different columns with same id: %s, %s",
+            leftColumn,
+            rightColumn);
+      }
+    }
+
     return new Schema(joinedColumns);
   }
 
@@ -288,6 +300,28 @@ public class TypeUtil {
   }
 
   /**
+   * Reassigns doc in a schema from another schema.
+   *
+   * <p>Doc are determined by field id. If a field in the schema cannot be found in the source
+   * schema, this will throw IllegalArgumentException.
+   *
+   * <p>This will not alter a schema's structure, nullability, or types.
+   *
+   * @param schema the schema to have doc reassigned
+   * @param docSourceSchema the schema from which field doc will be used
+   * @return an structurally identical schema with field ids matching the source schema
+   * @throws IllegalArgumentException if a field cannot be found (by id) in the source schema
+   */
+  public static Schema reassignDoc(Schema schema, Schema docSourceSchema) {
+    TypeUtil.CustomOrderSchemaVisitor<Type> visitor = new ReassignDoc(docSourceSchema);
+    return new Schema(
+        visitor
+            .schema(schema, new VisitFuture<>(schema.asStruct(), visitor))
+            .asStructType()
+            .fields());
+  }
+
+  /**
    * Reassigns ids in a schema from another schema.
    *
    * <p>Ids are determined by field names. If a field in the schema cannot be found in the source
@@ -332,10 +366,10 @@ public class TypeUtil {
 
     switch (from.typeId()) {
       case INTEGER:
-        return to == Types.LongType.get();
+        return to.typeId() == Type.TypeID.LONG;
 
       case FLOAT:
-        return to == Types.DoubleType.get();
+        return to.typeId() == Type.TypeID.DOUBLE;
 
       case DECIMAL:
         Types.DecimalType fromDecimal = (Types.DecimalType) from;
@@ -601,13 +635,13 @@ public class TypeUtil {
   }
 
   /**
-   * Used to traverse types with traversals other than pre-order.
+   * Used to traverse types with traversals other than post-order.
    *
    * <p>This passes a {@link Supplier} to each {@link CustomOrderSchemaVisitor visitor} method that
    * returns the result of traversing child types. Structs are passed an {@link Iterable} that
    * traverses child fields during iteration.
    *
-   * <p>An example use is assigning column IDs, which should be done with a post-order traversal.
+   * <p>An example use is assigning column IDs, which should be done with a pre-order traversal.
    *
    * @param type a type to traverse with a visitor
    * @param visitor a custom order visitor

@@ -22,7 +22,6 @@ import java.io.File;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
@@ -69,7 +68,6 @@ import org.junit.runners.Parameterized;
 public class TestIcebergStreamWriter {
   @Rule public TemporaryFolder tempFolder = new TemporaryFolder();
 
-  private String tablePath;
   private Table table;
 
   private final FileFormat format;
@@ -88,18 +86,17 @@ public class TestIcebergStreamWriter {
   }
 
   public TestIcebergStreamWriter(String format, boolean partitioned) {
-    this.format = FileFormat.valueOf(format.toUpperCase(Locale.ENGLISH));
+    this.format = FileFormat.fromString(format);
     this.partitioned = partitioned;
   }
 
   @Before
   public void before() throws IOException {
     File folder = tempFolder.newFolder();
-    tablePath = folder.getAbsolutePath();
 
     // Construct the iceberg table.
     Map<String, String> props = ImmutableMap.of(TableProperties.DEFAULT_FILE_FORMAT, format.name());
-    table = SimpleDataUtil.createTable(tablePath, props, partitioned);
+    table = SimpleDataUtil.createTable(folder.getAbsolutePath(), props, partitioned);
   }
 
   @Test
@@ -137,7 +134,7 @@ public class TestIcebergStreamWriter {
 
       // Assert the table records.
       SimpleDataUtil.assertTableRecords(
-          tablePath,
+          table,
           Lists.newArrayList(
               SimpleDataUtil.createRecord(1, "hello"),
               SimpleDataUtil.createRecord(2, "world"),
@@ -193,7 +190,7 @@ public class TestIcebergStreamWriter {
   }
 
   private Set<String> scanDataFiles() throws IOException {
-    Path dataDir = new Path(tablePath, "data");
+    Path dataDir = new Path(table.location(), "data");
     FileSystem fs = FileSystem.get(new Configuration());
     if (!fs.exists(dataDir)) {
       return ImmutableSet.of();
@@ -233,7 +230,32 @@ public class TestIcebergStreamWriter {
 
       result = WriteResult.builder().addAll(testHarness.extractOutputValues()).build();
       Assert.assertEquals(0, result.deleteFiles().length);
-      Assert.assertEquals(expectedDataFiles * 2, result.dataFiles().length);
+      // Datafiles should not be sent again
+      Assert.assertEquals(expectedDataFiles, result.dataFiles().length);
+    }
+  }
+
+  @Test
+  public void testBoundedStreamTriggeredEndInputBeforeTriggeringCheckpoint() throws Exception {
+    try (OneInputStreamOperatorTestHarness<RowData, WriteResult> testHarness =
+        createIcebergStreamWriter()) {
+      testHarness.processElement(SimpleDataUtil.createRowData(1, "hello"), 1);
+      testHarness.processElement(SimpleDataUtil.createRowData(2, "world"), 2);
+
+      testHarness.endInput();
+
+      long expectedDataFiles = partitioned ? 2 : 1;
+      WriteResult result = WriteResult.builder().addAll(testHarness.extractOutputValues()).build();
+      Assert.assertEquals(0, result.deleteFiles().length);
+      Assert.assertEquals(expectedDataFiles, result.dataFiles().length);
+
+      testHarness.prepareSnapshotPreBarrier(1L);
+
+      result = WriteResult.builder().addAll(testHarness.extractOutputValues()).build();
+      Assert.assertEquals(0, result.deleteFiles().length);
+      // It should be ensured that after endInput is triggered, when prepareSnapshotPreBarrier
+      // is triggered, write should only send WriteResult once
+      Assert.assertEquals(expectedDataFiles, result.dataFiles().length);
     }
   }
 
@@ -278,7 +300,7 @@ public class TestIcebergStreamWriter {
     }
 
     // Assert the table records.
-    SimpleDataUtil.assertTableRecords(tablePath, records);
+    SimpleDataUtil.assertTableRecords(table, records);
   }
 
   @Test

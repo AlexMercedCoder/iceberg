@@ -19,20 +19,45 @@
 package org.apache.iceberg.aws;
 
 import java.io.Serializable;
+import java.net.URI;
+import java.util.Collections;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 import org.apache.iceberg.aws.dynamodb.DynamoDbCatalog;
+import org.apache.iceberg.aws.glue.GlueCatalog;
 import org.apache.iceberg.aws.lakeformation.LakeFormationAwsClientFactory;
 import org.apache.iceberg.aws.s3.S3FileIO;
+import org.apache.iceberg.common.DynConstructors;
+import org.apache.iceberg.common.DynMethods;
+import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
-import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.base.Strings;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.util.PropertyUtil;
+import org.apache.iceberg.util.SerializableMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.awscore.client.builder.AwsSyncClientBuilder;
+import software.amazon.awssdk.core.client.builder.SdkClientBuilder;
+import software.amazon.awssdk.core.client.config.SdkAdvancedClientOption;
+import software.amazon.awssdk.core.signer.Signer;
+import software.amazon.awssdk.services.dynamodb.DynamoDbClientBuilder;
+import software.amazon.awssdk.services.glue.GlueClientBuilder;
+import software.amazon.awssdk.services.s3.S3ClientBuilder;
+import software.amazon.awssdk.services.s3.S3Configuration;
 import software.amazon.awssdk.services.s3.model.ObjectCannedACL;
 import software.amazon.awssdk.services.s3.model.Tag;
 
 public class AwsProperties implements Serializable {
+
+  private static final Logger LOG = LoggerFactory.getLogger(AwsProperties.class);
 
   /**
    * Type of S3 Server side encryption used, default to {@link
@@ -242,6 +267,8 @@ public class AwsProperties implements Serializable {
 
   public static final boolean S3_CHECKSUM_ENABLED_DEFAULT = false;
 
+  public static final String S3_SIGNER_IMPL = "s3.signer-impl";
+
   /** Configure the batch size used when deleting multiple files from a given S3 bucket */
   public static final String S3FILEIO_DELETE_BATCH_SIZE = "s3.delete.batch-size";
 
@@ -313,6 +340,14 @@ public class AwsProperties implements Serializable {
   public static final String CLIENT_ASSUME_ROLE_REGION = "client.assume-role.region";
 
   /**
+   * Used by {@link AssumeRoleAwsClientFactory}. Optional session name used to assume an IAM role.
+   *
+   * <p>For more details, see
+   * https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_iam-condition-keys.html#ck_rolesessionname
+   */
+  public static final String CLIENT_ASSUME_ROLE_SESSION_NAME = "client.assume-role.session-name";
+
+  /**
    * The type of {@link software.amazon.awssdk.http.SdkHttpClient} implementation used by {@link
    * AwsClientFactory} If set, all AWS clients will use this specified HTTP client. If not set,
    * {@link #HTTP_CLIENT_TYPE_DEFAULT} will be used. For specific types supported, see
@@ -337,6 +372,132 @@ public class AwsProperties implements Serializable {
   public static final String HTTP_CLIENT_TYPE_DEFAULT = HTTP_CLIENT_TYPE_URLCONNECTION;
 
   /**
+   * Used to configure the connection timeout in milliseconds for {@link
+   * software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient.Builder}. This flag only
+   * works when {@link #HTTP_CLIENT_TYPE} is set to {@link #HTTP_CLIENT_TYPE_URLCONNECTION}
+   *
+   * <p>For more details, see
+   * https://sdk.amazonaws.com/java/api/latest/software/amazon/awssdk/http/urlconnection/UrlConnectionHttpClient.Builder.html
+   */
+  public static final String HTTP_CLIENT_URLCONNECTION_CONNECTION_TIMEOUT_MS =
+      "http-client.urlconnection.connection-timeout-ms";
+
+  /**
+   * Used to configure the socket timeout in milliseconds for {@link
+   * software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient.Builder}. This flag only
+   * works when {@link #HTTP_CLIENT_TYPE} is set to {@link #HTTP_CLIENT_TYPE_URLCONNECTION}
+   *
+   * <p>For more details, see
+   * https://sdk.amazonaws.com/java/api/latest/software/amazon/awssdk/http/urlconnection/UrlConnectionHttpClient.Builder.html
+   */
+  public static final String HTTP_CLIENT_URLCONNECTION_SOCKET_TIMEOUT_MS =
+      "http-client.urlconnection.socket-timeout-ms";
+
+  /**
+   * Used to configure the connection timeout in milliseconds for {@link
+   * software.amazon.awssdk.http.apache.ApacheHttpClient.Builder}. This flag only works when {@link
+   * #HTTP_CLIENT_TYPE} is set to {@link #HTTP_CLIENT_TYPE_APACHE}
+   *
+   * <p>For more details, see
+   * https://sdk.amazonaws.com/java/api/latest/software/amazon/awssdk/http/apache/ApacheHttpClient.Builder.html
+   */
+  public static final String HTTP_CLIENT_APACHE_CONNECTION_TIMEOUT_MS =
+      "http-client.apache.connection-timeout-ms";
+
+  /**
+   * Used to configure the socket timeout in milliseconds for {@link
+   * software.amazon.awssdk.http.apache.ApacheHttpClient.Builder}. This flag only works when {@link
+   * #HTTP_CLIENT_TYPE} is set to {@link #HTTP_CLIENT_TYPE_APACHE}
+   *
+   * <p>For more details, see
+   * https://sdk.amazonaws.com/java/api/latest/software/amazon/awssdk/http/apache/ApacheHttpClient.Builder.html
+   */
+  public static final String HTTP_CLIENT_APACHE_SOCKET_TIMEOUT_MS =
+      "http-client.apache.socket-timeout-ms";
+
+  /**
+   * Used to configure the connection acquisition timeout in milliseconds for {@link
+   * software.amazon.awssdk.http.apache.ApacheHttpClient.Builder}. This flag only works when {@link
+   * #HTTP_CLIENT_TYPE} is set to {@link #HTTP_CLIENT_TYPE_APACHE}
+   *
+   * <p>For more details, see
+   * https://sdk.amazonaws.com/java/api/latest/software/amazon/awssdk/http/apache/ApacheHttpClient.Builder.html
+   */
+  public static final String HTTP_CLIENT_APACHE_CONNECTION_ACQUISITION_TIMEOUT_MS =
+      "http-client.apache.connection-acquisition-timeout-ms";
+
+  /**
+   * Used to configure the connection max idle time in milliseconds for {@link
+   * software.amazon.awssdk.http.apache.ApacheHttpClient.Builder}. This flag only works when {@link
+   * #HTTP_CLIENT_TYPE} is set to {@link #HTTP_CLIENT_TYPE_APACHE}
+   *
+   * <p>For more details, see
+   * https://sdk.amazonaws.com/java/api/latest/software/amazon/awssdk/http/apache/ApacheHttpClient.Builder.html
+   */
+  public static final String HTTP_CLIENT_APACHE_CONNECTION_MAX_IDLE_TIME_MS =
+      "http-client.apache.connection-max-idle-time-ms";
+
+  /**
+   * Used to configure the connection time to live in milliseconds for {@link
+   * software.amazon.awssdk.http.apache.ApacheHttpClient.Builder}. This flag only works when {@link
+   * #HTTP_CLIENT_TYPE} is set to {@link #HTTP_CLIENT_TYPE_APACHE}
+   *
+   * <p>For more details, see
+   * https://sdk.amazonaws.com/java/api/latest/software/amazon/awssdk/http/apache/ApacheHttpClient.Builder.html
+   */
+  public static final String HTTP_CLIENT_APACHE_CONNECTION_TIME_TO_LIVE_MS =
+      "http-client.apache.connection-time-to-live-ms";
+
+  /**
+   * Used to configure whether to enable the expect continue setting for {@link
+   * software.amazon.awssdk.http.apache.ApacheHttpClient.Builder}. This flag only works when {@link
+   * #HTTP_CLIENT_TYPE} is set to {@link #HTTP_CLIENT_TYPE_APACHE}
+   *
+   * <p>In default, this is disabled.
+   *
+   * <p>For more details, see
+   * https://sdk.amazonaws.com/java/api/latest/software/amazon/awssdk/http/apache/ApacheHttpClient.Builder.html
+   */
+  public static final String HTTP_CLIENT_APACHE_EXPECT_CONTINUE_ENABLED =
+      "http-client.apache.expect-continue-enabled";
+
+  /**
+   * Used to configure the max connections number for {@link
+   * software.amazon.awssdk.http.apache.ApacheHttpClient.Builder}. This flag only works when {@link
+   * #HTTP_CLIENT_TYPE} is set to {@link #HTTP_CLIENT_TYPE_APACHE}
+   *
+   * <p>For more details, see
+   * https://sdk.amazonaws.com/java/api/latest/software/amazon/awssdk/http/apache/ApacheHttpClient.Builder.html
+   */
+  public static final String HTTP_CLIENT_APACHE_MAX_CONNECTIONS =
+      "http-client.apache.max-connections";
+
+  /**
+   * Used to configure whether to enable the tcp keep alive setting for {@link
+   * software.amazon.awssdk.http.apache.ApacheHttpClient.Builder}. This flag only works when {@link
+   * #HTTP_CLIENT_TYPE} is set to {@link #HTTP_CLIENT_TYPE_APACHE}.
+   *
+   * <p>In default, this is disabled.
+   *
+   * <p>For more details, see
+   * https://sdk.amazonaws.com/java/api/latest/software/amazon/awssdk/http/apache/ApacheHttpClient.Builder.html
+   */
+  public static final String HTTP_CLIENT_APACHE_TCP_KEEP_ALIVE_ENABLED =
+      "http-client.apache.tcp-keep-alive-enabled";
+
+  /**
+   * Used to configure whether to use idle connection reaper for {@link
+   * software.amazon.awssdk.http.apache.ApacheHttpClient.Builder}. This flag only works when {@link
+   * #HTTP_CLIENT_TYPE} is set to {@link #HTTP_CLIENT_TYPE_APACHE}.
+   *
+   * <p>In default, this is enabled.
+   *
+   * <p>For more details, see
+   * https://sdk.amazonaws.com/java/api/latest/software/amazon/awssdk/http/apache/ApacheHttpClient.Builder.html
+   */
+  public static final String HTTP_CLIENT_APACHE_USE_IDLE_CONNECTION_REAPER_ENABLED =
+      "http-client.apache.use-idle-connection-reaper-enabled";
+  /**
    * Used by {@link S3FileIO} to tag objects when writing. To set, we can pass a catalog property.
    *
    * <p>For more details, see
@@ -345,6 +506,48 @@ public class AwsProperties implements Serializable {
    * <p>Example: s3.write.tags.my_key=my_val
    */
   public static final String S3_WRITE_TAGS_PREFIX = "s3.write.tags.";
+
+  /**
+   * Used by {@link GlueCatalog} to tag objects when writing. To set, we can pass a catalog
+   * property.
+   *
+   * <p>For more details, see
+   * https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-tagging.html
+   *
+   * <p>Example: s3.write.table-tag-enabled=true
+   */
+  public static final String S3_WRITE_TABLE_TAG_ENABLED = "s3.write.table-tag-enabled";
+
+  public static final boolean S3_WRITE_TABLE_TAG_ENABLED_DEFAULT = false;
+
+  /**
+   * Used by {@link GlueCatalog} to tag objects when writing. To set, we can pass a catalog
+   * property.
+   *
+   * <p>For more details, see
+   * https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-tagging.html
+   *
+   * <p>Example: s3.write.namespace-tag-enabled=true
+   */
+  public static final String S3_WRITE_NAMESPACE_TAG_ENABLED = "s3.write.namespace-tag-enabled";
+
+  public static final boolean S3_WRITE_NAMESPACE_TAG_ENABLED_DEFAULT = false;
+
+  /**
+   * Tag name that will be used by {@link #S3_WRITE_TAGS_PREFIX} when {@link
+   * #S3_WRITE_TABLE_TAG_ENABLED} is enabled
+   *
+   * <p>Example: iceberg.table=tableName
+   */
+  public static final String S3_TAG_ICEBERG_TABLE = "iceberg.table";
+
+  /**
+   * Tag name that will be used by {@link #S3_WRITE_TAGS_PREFIX} when {@link
+   * #S3_WRITE_NAMESPACE_TAG_ENABLED} is enabled
+   *
+   * <p>Example: iceberg.namespace=namespaceName
+   */
+  public static final String S3_TAG_ICEBERG_NAMESPACE = "iceberg.namespace";
 
   /**
    * Used by {@link S3FileIO} to tag objects when deleting. When this config is set, objects are
@@ -385,6 +588,16 @@ public class AwsProperties implements Serializable {
   public static final boolean S3_ACCELERATION_ENABLED_DEFAULT = false;
 
   /**
+   * Determines if S3 client will use the Dualstack Mode, default to false.
+   *
+   * <p>For more details, see
+   * https://docs.aws.amazon.com/AmazonS3/latest/userguide/dual-stack-endpoints.html
+   */
+  public static final String S3_DUALSTACK_ENABLED = "s3.dualstack-enabled";
+
+  public static final boolean S3_DUALSTACK_ENABLED_DEFAULT = false;
+
+  /**
    * Used by {@link S3FileIO}, prefix used for bucket access point configuration. To set, we can
    * pass a catalog property.
    *
@@ -393,11 +606,6 @@ public class AwsProperties implements Serializable {
    * <p>Example: s3.access-points.my-bucket=access-point
    */
   public static final String S3_ACCESS_POINTS_PREFIX = "s3.access-points.";
-
-  /**
-   * @deprecated will be removed at 0.15.0, please use {@link #S3_CHECKSUM_ENABLED_DEFAULT} instead
-   */
-  @Deprecated public static final boolean CLIENT_ENABLE_ETAG_CHECK_DEFAULT = false;
 
   /**
    * This flag controls whether the S3 client will be initialized during the S3FileIO
@@ -420,9 +628,23 @@ public class AwsProperties implements Serializable {
    */
   public static final String LAKE_FORMATION_DB_NAME = "lakeformation.db-name";
 
+  private static final String HTTP_CLIENT_PREFIX = "http-client.";
+  private String httpClientType;
+  private final Map<String, String> httpClientProperties;
+  private final Set<software.amazon.awssdk.services.sts.model.Tag> stsClientAssumeRoleTags;
+
+  private String clientAssumeRoleArn;
+  private String clientAssumeRoleExternalId;
+  private int clientAssumeRoleTimeoutSec;
+  private String clientAssumeRoleRegion;
+  private String clientAssumeRoleSessionName;
+
   private String s3FileIoSseType;
   private String s3FileIoSseKey;
   private String s3FileIoSseMd5;
+  private String s3AccessKeyId;
+  private String s3SecretAccessKey;
+  private String s3SessionToken;
   private int s3FileIoMultipartUploadThreads;
   private int s3FileIoMultiPartSize;
   private int s3FileIoDeleteBatchSize;
@@ -431,25 +653,50 @@ public class AwsProperties implements Serializable {
   private ObjectCannedACL s3FileIoAcl;
   private boolean isS3ChecksumEnabled;
   private final Set<Tag> s3WriteTags;
+  private boolean s3WriteTableTagEnabled;
+  private boolean s3WriteNamespaceTagEnabled;
   private final Set<Tag> s3DeleteTags;
   private int s3FileIoDeleteThreads;
   private boolean isS3DeleteEnabled;
   private final Map<String, String> s3BucketToAccessPointMapping;
   private boolean s3PreloadClientEnabled;
+  private boolean s3DualStackEnabled;
+  private boolean s3PathStyleAccess;
+  private boolean s3UseArnRegionEnabled;
+  private boolean s3AccelerationEnabled;
+  private String s3Endpoint;
 
+  private String glueEndpoint;
   private String glueCatalogId;
   private boolean glueCatalogSkipArchive;
   private boolean glueCatalogSkipNameValidation;
   private boolean glueLakeFormationEnabled;
 
   private String dynamoDbTableName;
+  private String dynamoDbEndpoint;
+
+  private final String s3SignerImpl;
+  private final Map<String, String> allProperties;
 
   public AwsProperties() {
+    this.httpClientType = HTTP_CLIENT_TYPE_DEFAULT;
+    this.httpClientProperties = Collections.emptyMap();
+    this.stsClientAssumeRoleTags = Sets.newHashSet();
+
+    this.clientAssumeRoleArn = null;
+    this.clientAssumeRoleTimeoutSec = CLIENT_ASSUME_ROLE_TIMEOUT_SEC_DEFAULT;
+    this.clientAssumeRoleExternalId = null;
+    this.clientAssumeRoleRegion = null;
+    this.clientAssumeRoleSessionName = null;
+
     this.s3FileIoSseType = S3FILEIO_SSE_TYPE_NONE;
     this.s3FileIoSseKey = null;
     this.s3FileIoSseMd5 = null;
+    this.s3AccessKeyId = null;
+    this.s3SecretAccessKey = null;
+    this.s3SessionToken = null;
     this.s3FileIoAcl = null;
-
+    this.s3Endpoint = null;
     this.s3FileIoMultipartUploadThreads = Runtime.getRuntime().availableProcessors();
     this.s3FileIoMultiPartSize = S3FILEIO_MULTIPART_SIZE_DEFAULT;
     this.s3FileIoMultipartThresholdFactor = S3FILEIO_MULTIPART_THRESHOLD_FACTOR_DEFAULT;
@@ -457,91 +704,125 @@ public class AwsProperties implements Serializable {
     this.s3fileIoStagingDirectory = System.getProperty("java.io.tmpdir");
     this.isS3ChecksumEnabled = S3_CHECKSUM_ENABLED_DEFAULT;
     this.s3WriteTags = Sets.newHashSet();
+    this.s3WriteTableTagEnabled = S3_WRITE_TABLE_TAG_ENABLED_DEFAULT;
+    this.s3WriteNamespaceTagEnabled = S3_WRITE_NAMESPACE_TAG_ENABLED_DEFAULT;
     this.s3DeleteTags = Sets.newHashSet();
     this.s3FileIoDeleteThreads = Runtime.getRuntime().availableProcessors();
     this.isS3DeleteEnabled = S3_DELETE_ENABLED_DEFAULT;
-    this.s3BucketToAccessPointMapping = ImmutableMap.of();
+    this.s3BucketToAccessPointMapping = Collections.emptyMap();
     this.s3PreloadClientEnabled = S3_PRELOAD_CLIENT_ENABLED_DEFAULT;
+    this.s3DualStackEnabled = S3_DUALSTACK_ENABLED_DEFAULT;
+    this.s3PathStyleAccess = S3FILEIO_PATH_STYLE_ACCESS_DEFAULT;
+    this.s3UseArnRegionEnabled = S3_USE_ARN_REGION_ENABLED_DEFAULT;
+    this.s3AccelerationEnabled = S3_ACCELERATION_ENABLED_DEFAULT;
 
     this.glueCatalogId = null;
+    this.glueEndpoint = null;
     this.glueCatalogSkipArchive = GLUE_CATALOG_SKIP_ARCHIVE_DEFAULT;
     this.glueCatalogSkipNameValidation = GLUE_CATALOG_SKIP_NAME_VALIDATION_DEFAULT;
     this.glueLakeFormationEnabled = GLUE_LAKEFORMATION_ENABLED_DEFAULT;
 
+    this.dynamoDbEndpoint = null;
     this.dynamoDbTableName = DYNAMODB_TABLE_NAME_DEFAULT;
+
+    this.s3SignerImpl = null;
+    this.allProperties = Maps.newHashMap();
+
+    ValidationException.check(
+        s3KeyIdAccessKeyBothConfigured(),
+        "S3 client access key ID and secret access key must be set at the same time");
   }
 
+  @SuppressWarnings("MethodLength")
   public AwsProperties(Map<String, String> properties) {
-    this.s3FileIoSseType =
-        properties.getOrDefault(
-            AwsProperties.S3FILEIO_SSE_TYPE, AwsProperties.S3FILEIO_SSE_TYPE_NONE);
-    this.s3FileIoSseKey = properties.get(AwsProperties.S3FILEIO_SSE_KEY);
-    this.s3FileIoSseMd5 = properties.get(AwsProperties.S3FILEIO_SSE_MD5);
-    if (AwsProperties.S3FILEIO_SSE_TYPE_CUSTOM.equals(s3FileIoSseType)) {
+    this.httpClientType =
+        PropertyUtil.propertyAsString(properties, HTTP_CLIENT_TYPE, HTTP_CLIENT_TYPE_DEFAULT);
+    this.httpClientProperties =
+        PropertyUtil.filterProperties(properties, key -> key.startsWith(HTTP_CLIENT_PREFIX));
+    this.stsClientAssumeRoleTags = toStsTags(properties, CLIENT_ASSUME_ROLE_TAGS_PREFIX);
+    this.clientAssumeRoleArn = properties.get(CLIENT_ASSUME_ROLE_ARN);
+    this.clientAssumeRoleTimeoutSec =
+        PropertyUtil.propertyAsInt(
+            properties, CLIENT_ASSUME_ROLE_TIMEOUT_SEC, CLIENT_ASSUME_ROLE_TIMEOUT_SEC_DEFAULT);
+    this.clientAssumeRoleExternalId = properties.get(CLIENT_ASSUME_ROLE_EXTERNAL_ID);
+    this.clientAssumeRoleRegion = properties.get(CLIENT_ASSUME_ROLE_REGION);
+    this.clientAssumeRoleSessionName = properties.get(CLIENT_ASSUME_ROLE_SESSION_NAME);
+
+    this.s3FileIoSseType = properties.getOrDefault(S3FILEIO_SSE_TYPE, S3FILEIO_SSE_TYPE_NONE);
+    this.s3FileIoSseKey = properties.get(S3FILEIO_SSE_KEY);
+    this.s3FileIoSseMd5 = properties.get(S3FILEIO_SSE_MD5);
+    this.s3AccessKeyId = properties.get(S3FILEIO_ACCESS_KEY_ID);
+    this.s3SecretAccessKey = properties.get(S3FILEIO_SECRET_ACCESS_KEY);
+    this.s3SessionToken = properties.get(S3FILEIO_SESSION_TOKEN);
+    if (S3FILEIO_SSE_TYPE_CUSTOM.equals(s3FileIoSseType)) {
       Preconditions.checkNotNull(
           s3FileIoSseKey, "Cannot initialize SSE-C S3FileIO with null encryption key");
       Preconditions.checkNotNull(
           s3FileIoSseMd5, "Cannot initialize SSE-C S3FileIO with null encryption key MD5");
     }
+    this.s3Endpoint = properties.get(S3FILEIO_ENDPOINT);
 
+    this.glueEndpoint = properties.get(GLUE_CATALOG_ENDPOINT);
     this.glueCatalogId = properties.get(GLUE_CATALOG_ID);
     this.glueCatalogSkipArchive =
         PropertyUtil.propertyAsBoolean(
-            properties,
-            AwsProperties.GLUE_CATALOG_SKIP_ARCHIVE,
-            AwsProperties.GLUE_CATALOG_SKIP_ARCHIVE_DEFAULT);
+            properties, GLUE_CATALOG_SKIP_ARCHIVE, GLUE_CATALOG_SKIP_ARCHIVE_DEFAULT);
     this.glueCatalogSkipNameValidation =
         PropertyUtil.propertyAsBoolean(
             properties,
-            AwsProperties.GLUE_CATALOG_SKIP_NAME_VALIDATION,
-            AwsProperties.GLUE_CATALOG_SKIP_NAME_VALIDATION_DEFAULT);
+            GLUE_CATALOG_SKIP_NAME_VALIDATION,
+            GLUE_CATALOG_SKIP_NAME_VALIDATION_DEFAULT);
     this.glueLakeFormationEnabled =
         PropertyUtil.propertyAsBoolean(
             properties, GLUE_LAKEFORMATION_ENABLED, GLUE_LAKEFORMATION_ENABLED_DEFAULT);
-
     this.s3FileIoMultipartUploadThreads =
         PropertyUtil.propertyAsInt(
             properties,
             S3FILEIO_MULTIPART_UPLOAD_THREADS,
             Runtime.getRuntime().availableProcessors());
-
+    this.s3PathStyleAccess =
+        PropertyUtil.propertyAsBoolean(
+            properties, S3FILEIO_PATH_STYLE_ACCESS, S3FILEIO_PATH_STYLE_ACCESS_DEFAULT);
+    this.s3UseArnRegionEnabled =
+        PropertyUtil.propertyAsBoolean(
+            properties, S3_USE_ARN_REGION_ENABLED, S3_USE_ARN_REGION_ENABLED_DEFAULT);
+    this.s3AccelerationEnabled =
+        PropertyUtil.propertyAsBoolean(
+            properties, S3_ACCELERATION_ENABLED, S3_ACCELERATION_ENABLED_DEFAULT);
+    this.s3DualStackEnabled =
+        PropertyUtil.propertyAsBoolean(
+            properties, S3_DUALSTACK_ENABLED, S3_DUALSTACK_ENABLED_DEFAULT);
     try {
       this.s3FileIoMultiPartSize =
           PropertyUtil.propertyAsInt(
               properties, S3FILEIO_MULTIPART_SIZE, S3FILEIO_MULTIPART_SIZE_DEFAULT);
     } catch (NumberFormatException e) {
       throw new IllegalArgumentException(
-          "Input malformed or exceeded maximum multipart upload size 5GB: %s"
-              + properties.get(S3FILEIO_MULTIPART_SIZE));
+          String.format(
+              "Input malformed or exceeded maximum multipart upload size 5GB: %s",
+              properties.get(S3FILEIO_MULTIPART_SIZE)));
     }
-
     this.s3FileIoMultipartThresholdFactor =
         PropertyUtil.propertyAsDouble(
             properties,
             S3FILEIO_MULTIPART_THRESHOLD_FACTOR,
             S3FILEIO_MULTIPART_THRESHOLD_FACTOR_DEFAULT);
-
     Preconditions.checkArgument(
         s3FileIoMultipartThresholdFactor >= 1.0, "Multipart threshold factor must be >= to 1.0");
-
     Preconditions.checkArgument(
         s3FileIoMultiPartSize >= S3FILEIO_MULTIPART_SIZE_MIN,
         "Minimum multipart upload object size must be larger than 5 MB.");
-
     this.s3fileIoStagingDirectory =
         PropertyUtil.propertyAsString(
             properties, S3FILEIO_STAGING_DIRECTORY, System.getProperty("java.io.tmpdir"));
-
     String aclType = properties.get(S3FILEIO_ACL);
     this.s3FileIoAcl = ObjectCannedACL.fromValue(aclType);
     Preconditions.checkArgument(
         s3FileIoAcl == null || !s3FileIoAcl.equals(ObjectCannedACL.UNKNOWN_TO_SDK_VERSION),
         "Cannot support S3 CannedACL " + aclType);
-
     this.isS3ChecksumEnabled =
         PropertyUtil.propertyAsBoolean(
             properties, S3_CHECKSUM_ENABLED, S3_CHECKSUM_ENABLED_DEFAULT);
-
     this.s3FileIoDeleteBatchSize =
         PropertyUtil.propertyAsInt(
             properties, S3FILEIO_DELETE_BATCH_SIZE, S3FILEIO_DELETE_BATCH_SIZE_DEFAULT);
@@ -549,9 +830,14 @@ public class AwsProperties implements Serializable {
         s3FileIoDeleteBatchSize > 0 && s3FileIoDeleteBatchSize <= S3FILEIO_DELETE_BATCH_SIZE_MAX,
         String.format(
             "Deletion batch size must be between 1 and %s", S3FILEIO_DELETE_BATCH_SIZE_MAX));
-
-    this.s3WriteTags = toTags(properties, S3_WRITE_TAGS_PREFIX);
-    this.s3DeleteTags = toTags(properties, S3_DELETE_TAGS_PREFIX);
+    this.s3WriteTags = toS3Tags(properties, S3_WRITE_TAGS_PREFIX);
+    this.s3WriteTableTagEnabled =
+        PropertyUtil.propertyAsBoolean(
+            properties, S3_WRITE_TABLE_TAG_ENABLED, S3_WRITE_TABLE_TAG_ENABLED_DEFAULT);
+    this.s3WriteNamespaceTagEnabled =
+        PropertyUtil.propertyAsBoolean(
+            properties, S3_WRITE_NAMESPACE_TAG_ENABLED, S3_WRITE_NAMESPACE_TAG_ENABLED_DEFAULT);
+    this.s3DeleteTags = toS3Tags(properties, S3_DELETE_TAGS_PREFIX);
     this.s3FileIoDeleteThreads =
         PropertyUtil.propertyAsInt(
             properties, S3FILEIO_DELETE_THREADS, Runtime.getRuntime().availableProcessors());
@@ -561,12 +847,42 @@ public class AwsProperties implements Serializable {
         PropertyUtil.propertiesWithPrefix(properties, S3_ACCESS_POINTS_PREFIX);
     this.s3PreloadClientEnabled =
         PropertyUtil.propertyAsBoolean(
-            properties,
-            AwsProperties.S3_PRELOAD_CLIENT_ENABLED,
-            AwsProperties.S3_PRELOAD_CLIENT_ENABLED_DEFAULT);
+            properties, S3_PRELOAD_CLIENT_ENABLED, S3_PRELOAD_CLIENT_ENABLED_DEFAULT);
 
+    this.dynamoDbEndpoint = properties.get(DYNAMODB_ENDPOINT);
     this.dynamoDbTableName =
         PropertyUtil.propertyAsString(properties, DYNAMODB_TABLE_NAME, DYNAMODB_TABLE_NAME_DEFAULT);
+
+    this.s3SignerImpl = properties.get(S3_SIGNER_IMPL);
+    this.allProperties = SerializableMap.copyOf(properties);
+
+    ValidationException.check(
+        s3KeyIdAccessKeyBothConfigured(),
+        "S3 client access key ID and secret access key must be set at the same time");
+  }
+
+  public Set<software.amazon.awssdk.services.sts.model.Tag> stsClientAssumeRoleTags() {
+    return stsClientAssumeRoleTags;
+  }
+
+  public String clientAssumeRoleArn() {
+    return clientAssumeRoleArn;
+  }
+
+  public int clientAssumeRoleTimeoutSec() {
+    return clientAssumeRoleTimeoutSec;
+  }
+
+  public String clientAssumeRoleExternalId() {
+    return clientAssumeRoleExternalId;
+  }
+
+  public String clientAssumeRoleRegion() {
+    return clientAssumeRoleRegion;
+  }
+
+  public String clientAssumeRoleSessionName() {
+    return clientAssumeRoleSessionName;
   }
 
   public String s3FileIoSseType() {
@@ -701,6 +1017,22 @@ public class AwsProperties implements Serializable {
     return s3WriteTags;
   }
 
+  public boolean s3WriteTableTagEnabled() {
+    return s3WriteTableTagEnabled;
+  }
+
+  public void setS3WriteTableTagEnabled(boolean s3WriteTableNameTagEnabled) {
+    this.s3WriteTableTagEnabled = s3WriteTableNameTagEnabled;
+  }
+
+  public boolean s3WriteNamespaceTagEnabled() {
+    return s3WriteNamespaceTagEnabled;
+  }
+
+  public void setS3WriteNamespaceTagEnabled(boolean s3WriteNamespaceTagEnabled) {
+    this.s3WriteNamespaceTagEnabled = s3WriteNamespaceTagEnabled;
+  }
+
   public Set<Tag> s3DeleteTags() {
     return s3DeleteTags;
   }
@@ -721,13 +1053,242 @@ public class AwsProperties implements Serializable {
     this.isS3DeleteEnabled = s3DeleteEnabled;
   }
 
-  private Set<Tag> toTags(Map<String, String> properties, String prefix) {
+  public Map<String, String> s3BucketToAccessPointMapping() {
+    return s3BucketToAccessPointMapping;
+  }
+
+  public Map<String, String> httpClientProperties() {
+    return httpClientProperties;
+  }
+
+  /**
+   * Configure the credentials for an S3 client.
+   *
+   * <p>Sample usage:
+   *
+   * <pre>
+   *     S3Client.builder().applyMutation(awsProperties::applyS3CredentialConfigurations)
+   * </pre>
+   */
+  public <T extends S3ClientBuilder> void applyS3CredentialConfigurations(T builder) {
+    builder.credentialsProvider(
+        credentialsProvider(s3AccessKeyId, s3SecretAccessKey, s3SessionToken));
+  }
+
+  /**
+   * Configure services settings for an S3 client. The settings include: s3DualStack,
+   * s3UseArnRegion, s3PathStyleAccess, and s3Acceleration
+   *
+   * <p>Sample usage:
+   *
+   * <pre>
+   *     S3Client.builder().applyMutation(awsProperties::applyS3ServiceConfigurations)
+   * </pre>
+   */
+  public <T extends S3ClientBuilder> void applyS3ServiceConfigurations(T builder) {
+    builder
+        .dualstackEnabled(s3DualStackEnabled)
+        .serviceConfiguration(
+            S3Configuration.builder()
+                .pathStyleAccessEnabled(s3PathStyleAccess)
+                .useArnRegionEnabled(s3UseArnRegionEnabled)
+                .accelerateModeEnabled(s3AccelerationEnabled)
+                .build());
+  }
+
+  /**
+   * Configure a signer for an S3 client.
+   *
+   * <p>Sample usage:
+   *
+   * <pre>
+   *     S3Client.builder().applyMutation(awsProperties::applyS3SignerConfiguration)
+   * </pre>
+   */
+  public <T extends S3ClientBuilder> void applyS3SignerConfiguration(T builder) {
+    if (null != s3SignerImpl) {
+      builder.overrideConfiguration(
+          c -> c.putAdvancedOption(SdkAdvancedClientOption.SIGNER, loadS3SignerDynamically()));
+    }
+  }
+
+  private Signer loadS3SignerDynamically() {
+    // load the signer implementation dynamically
+    Object signer = null;
+    try {
+      signer =
+          DynMethods.builder("create")
+              .impl(s3SignerImpl, Map.class)
+              .buildStaticChecked()
+              .invoke(allProperties);
+    } catch (NoSuchMethodException e) {
+      LOG.warn(
+          "Cannot find static method create(Map<String, String> properties) for signer {}",
+          s3SignerImpl,
+          e);
+    }
+
+    if (null == signer) {
+      try {
+        signer = DynMethods.builder("create").impl(s3SignerImpl).buildChecked().invoke(null);
+      } catch (NoSuchMethodException e) {
+        LOG.warn("Cannot find static method create() for signer {}", s3SignerImpl, e);
+      }
+    }
+
+    if (null == signer) {
+      // try via default no-arg constructor
+      try {
+        signer = DynConstructors.builder().impl(s3SignerImpl).buildChecked().newInstance();
+      } catch (NoSuchMethodException e) {
+        LOG.warn("Cannot find no-arg constructor for signer {}", s3SignerImpl, e);
+      }
+    }
+
+    Preconditions.checkArgument(
+        null != signer, "Cannot instantiate custom signer: %s", s3SignerImpl);
+
+    Preconditions.checkArgument(
+        signer instanceof Signer,
+        "Custom signer %s must be an instance of %s",
+        s3SignerImpl,
+        Signer.class.getName());
+    return (Signer) signer;
+  }
+
+  /**
+   * Configure the httpClient for a client according to the HttpClientType. The two supported
+   * HttpClientTypes are urlconnection and apache
+   *
+   * <p>Sample usage:
+   *
+   * <pre>
+   *     S3Client.builder().applyMutation(awsProperties::applyHttpClientConfigurations)
+   * </pre>
+   */
+  public <T extends AwsSyncClientBuilder> void applyHttpClientConfigurations(T builder) {
+    if (Strings.isNullOrEmpty(httpClientType)) {
+      httpClientType = HTTP_CLIENT_TYPE_DEFAULT;
+    }
+    switch (httpClientType) {
+      case HTTP_CLIENT_TYPE_URLCONNECTION:
+        UrlConnectionHttpClientConfigurations urlConnectionHttpClientConfigurations =
+            (UrlConnectionHttpClientConfigurations)
+                loadHttpClientConfigurations(UrlConnectionHttpClientConfigurations.class.getName());
+        urlConnectionHttpClientConfigurations.configureHttpClientBuilder(builder);
+        break;
+      case HTTP_CLIENT_TYPE_APACHE:
+        ApacheHttpClientConfigurations apacheHttpClientConfigurations =
+            (ApacheHttpClientConfigurations)
+                loadHttpClientConfigurations(ApacheHttpClientConfigurations.class.getName());
+        apacheHttpClientConfigurations.configureHttpClientBuilder(builder);
+        break;
+      default:
+        throw new IllegalArgumentException("Unrecognized HTTP client type " + httpClientType);
+    }
+  }
+
+  /**
+   * Override the endpoint for an S3 client.
+   *
+   * <p>Sample usage:
+   *
+   * <pre>
+   *     S3Client.builder().applyMutation(awsProperties::applyS3EndpointConfigurations)
+   * </pre>
+   */
+  public <T extends S3ClientBuilder> void applyS3EndpointConfigurations(T builder) {
+    configureEndpoint(builder, s3Endpoint);
+  }
+
+  /**
+   * Override the endpoint for a glue client.
+   *
+   * <p>Sample usage:
+   *
+   * <pre>
+   *     GlueClient.builder().applyMutation(awsProperties::applyS3EndpointConfigurations)
+   * </pre>
+   */
+  public <T extends GlueClientBuilder> void applyGlueEndpointConfigurations(T builder) {
+    configureEndpoint(builder, glueEndpoint);
+  }
+
+  /**
+   * Override the endpoint for a dynamoDb client.
+   *
+   * <p>Sample usage:
+   *
+   * <pre>
+   *     DynamoDbClient.builder().applyMutation(awsProperties::applyS3EndpointConfigurations)
+   * </pre>
+   */
+  public <T extends DynamoDbClientBuilder> void applyDynamoDbEndpointConfigurations(T builder) {
+    configureEndpoint(builder, dynamoDbEndpoint);
+  }
+
+  private Set<Tag> toS3Tags(Map<String, String> properties, String prefix) {
     return PropertyUtil.propertiesWithPrefix(properties, prefix).entrySet().stream()
         .map(e -> Tag.builder().key(e.getKey()).value(e.getValue()).build())
         .collect(Collectors.toSet());
   }
 
-  public Map<String, String> s3BucketToAccessPointMapping() {
-    return s3BucketToAccessPointMapping;
+  private Set<software.amazon.awssdk.services.sts.model.Tag> toStsTags(
+      Map<String, String> properties, String prefix) {
+    return PropertyUtil.propertiesWithPrefix(properties, prefix).entrySet().stream()
+        .map(
+            e ->
+                software.amazon.awssdk.services.sts.model.Tag.builder()
+                    .key(e.getKey())
+                    .value(e.getValue())
+                    .build())
+        .collect(Collectors.toSet());
+  }
+
+  private boolean s3KeyIdAccessKeyBothConfigured() {
+    return (s3AccessKeyId == null) == (s3SecretAccessKey == null);
+  }
+
+  private AwsCredentialsProvider credentialsProvider(
+      String accessKeyId, String secretAccessKey, String sessionToken) {
+    if (accessKeyId != null) {
+      if (sessionToken == null) {
+        return StaticCredentialsProvider.create(
+            AwsBasicCredentials.create(accessKeyId, secretAccessKey));
+      } else {
+        return StaticCredentialsProvider.create(
+            AwsSessionCredentials.create(accessKeyId, secretAccessKey, sessionToken));
+      }
+    } else {
+      return DefaultCredentialsProvider.create();
+    }
+  }
+
+  private <T extends SdkClientBuilder> void configureEndpoint(T builder, String endpoint) {
+    if (endpoint != null) {
+      builder.endpointOverride(URI.create(endpoint));
+    }
+  }
+
+  /**
+   * Dynamically load the http client builder to avoid runtime deps requirements of both {@link
+   * software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient} and {@link
+   * software.amazon.awssdk.http.apache.ApacheHttpClient}, since including both will cause error
+   * described in <a href="https://github.com/apache/iceberg/issues/6715">issue#6715</a>
+   */
+  private Object loadHttpClientConfigurations(String impl) {
+    Object httpClientConfigurations;
+    try {
+      httpClientConfigurations =
+          DynMethods.builder("create")
+              .hiddenImpl(impl, Map.class)
+              .buildStaticChecked()
+              .invoke(httpClientProperties);
+      return httpClientConfigurations;
+    } catch (NoSuchMethodException e) {
+      throw new IllegalArgumentException(
+          String.format("Cannot create %s to generate and configure the http client builder", impl),
+          e);
+    }
   }
 }

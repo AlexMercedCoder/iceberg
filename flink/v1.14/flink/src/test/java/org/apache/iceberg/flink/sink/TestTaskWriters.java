@@ -21,7 +21,6 @@ package org.apache.iceberg.flink.sink;
 import java.io.File;
 import java.io.IOException;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.types.logical.RowType;
@@ -70,22 +69,20 @@ public class TestTaskWriters {
   private final FileFormat format;
   private final boolean partitioned;
 
-  private String path;
   private Table table;
 
   public TestTaskWriters(String format, boolean partitioned) {
-    this.format = FileFormat.valueOf(format.toUpperCase(Locale.ENGLISH));
+    this.format = FileFormat.fromString(format);
     this.partitioned = partitioned;
   }
 
   @Before
   public void before() throws IOException {
     File folder = tempFolder.newFolder();
-    path = folder.getAbsolutePath();
 
     // Construct the iceberg table with the specified file format.
     Map<String, String> props = ImmutableMap.of(TableProperties.DEFAULT_FILE_FORMAT, format.name());
-    table = SimpleDataUtil.createTable(path, props, partitioned);
+    table = SimpleDataUtil.createTable(folder.getAbsolutePath(), props, partitioned);
   }
 
   @Test
@@ -171,7 +168,7 @@ public class TestTaskWriters {
 
       // Assert the data rows.
       SimpleDataUtil.assertTableRecords(
-          path,
+          table,
           Lists.newArrayList(
               SimpleDataUtil.createRecord(1, "a"),
               SimpleDataUtil.createRecord(2, "b"),
@@ -206,7 +203,7 @@ public class TestTaskWriters {
       appendFiles.commit();
 
       // Assert the data rows.
-      SimpleDataUtil.assertTableRecords(path, records);
+      SimpleDataUtil.assertTableRecords(table, records);
     }
   }
 
@@ -227,7 +224,7 @@ public class TestTaskWriters {
       appendFiles.commit();
 
       // Assert the data rows.
-      SimpleDataUtil.assertTableRows(path, Lists.newArrayList(rows));
+      SimpleDataUtil.assertTableRows(table, Lists.newArrayList(rows));
     }
   }
 
@@ -238,6 +235,7 @@ public class TestTaskWriters {
             (RowType) SimpleDataUtil.FLINK_SCHEMA.toRowDataType().getLogicalType(),
             targetFileSize,
             format,
+            table.properties(),
             null,
             false);
     taskWriterFactory.initialize(1, 1);

@@ -18,6 +18,12 @@
  */
 package org.apache.iceberg.rest;
 
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockserver.integration.ClientAndServer.startClientAndServer;
 import static org.mockserver.model.HttpRequest.request;
 import static org.mockserver.model.HttpResponse.response;
@@ -28,10 +34,8 @@ import java.io.IOException;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import org.apache.iceberg.AssertHelpers;
-import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.IcebergBuild;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.rest.responses.ErrorResponse;
@@ -63,7 +67,7 @@ public class TestHTTPClient {
   @BeforeClass
   public static void beforeClass() {
     mockServer = startClientAndServer(PORT);
-    restClient = new HTTPClientFactory().apply(ImmutableMap.of(CatalogProperties.URI, URI));
+    restClient = HTTPClient.builder().uri(URI).build();
     icebergBuildGitCommitShort = IcebergBuild.gitCommitShortId();
     icebergBuildFullVersion = IcebergBuild.fullVersion();
   }
@@ -117,16 +121,14 @@ public class TestHTTPClient {
   public static void testHttpMethodOnSuccess(HttpMethod method) throws JsonProcessingException {
     Item body = new Item(0L, "hank");
     int statusCode = 200;
-    AtomicInteger errorCounter = new AtomicInteger(0);
-    Consumer<ErrorResponse> onError =
-        (error) -> {
-          errorCounter.incrementAndGet();
-          throw new RuntimeException("Failure response");
-        };
+
+    ErrorHandler onError = mock(ErrorHandler.class);
+    doThrow(new RuntimeException("Failure response")).when(onError).accept(any());
 
     String path = addRequestTestCaseAndGetPath(method, body, statusCode);
 
-    Item successResponse = doExecuteRequest(method, path, body, onError);
+    Item successResponse =
+        doExecuteRequest(method, path, body, onError, h -> assertThat(h).isNotEmpty());
 
     if (method.usesRequestBody()) {
       Assert.assertEquals(
@@ -134,23 +136,22 @@ public class TestHTTPClient {
           successResponse,
           body);
     }
-    Assert.assertEquals(
-        "On a successful " + method + ", the error handler should not be called",
-        0,
-        errorCounter.get());
+
+    verify(onError, never()).accept(any());
   }
 
   public static void testHttpMethodOnFailure(HttpMethod method) throws JsonProcessingException {
     Item body = new Item(0L, "hank");
     int statusCode = 404;
-    AtomicInteger errorCounter = new AtomicInteger(0);
-    Consumer<ErrorResponse> onError =
-        error -> {
-          errorCounter.incrementAndGet();
-          throw new RuntimeException(
-              String.format(
-                  "Called error handler for method %s due to status code: %d", method, statusCode));
-        };
+
+    ErrorHandler onError = mock(ErrorHandler.class);
+    doThrow(
+            new RuntimeException(
+                String.format(
+                    "Called error handler for method %s due to status code: %d",
+                    method, statusCode)))
+        .when(onError)
+        .accept(any());
 
     String path = addRequestTestCaseAndGetPath(method, body, statusCode);
 
@@ -159,12 +160,9 @@ public class TestHTTPClient {
         RuntimeException.class,
         String.format(
             "Called error handler for method %s due to status code: %d", method, statusCode),
-        () -> doExecuteRequest(method, path, body, onError));
+        () -> doExecuteRequest(method, path, body, onError, h -> {}));
 
-    Assert.assertEquals(
-        "On an unsuccessful " + method + ", the error handler should be called",
-        1,
-        errorCounter.get());
+    verify(onError).accept(any());
   }
 
   // Adds a request that the mock-server can match against, based on the method, path, body, and
@@ -186,9 +184,8 @@ public class TestHTTPClient {
         request("/" + path)
             .withMethod(method.name().toUpperCase(Locale.ROOT))
             .withHeader("Authorization", "Bearer " + BEARER_AUTH_TOKEN)
-            .withHeader(HTTPClientFactory.CLIENT_VERSION_HEADER, icebergBuildFullVersion)
-            .withHeader(
-                HTTPClientFactory.CLIENT_GIT_COMMIT_SHORT_HEADER, icebergBuildGitCommitShort);
+            .withHeader(HTTPClient.CLIENT_VERSION_HEADER, icebergBuildFullVersion)
+            .withHeader(HTTPClient.CLIENT_GIT_COMMIT_SHORT_HEADER, icebergBuildGitCommitShort);
 
     if (method.usesRequestBody()) {
       mockRequest = mockRequest.withBody(asJson);
@@ -214,18 +211,22 @@ public class TestHTTPClient {
   }
 
   private static Item doExecuteRequest(
-      HttpMethod method, String path, Item body, Consumer<ErrorResponse> onError) {
+      HttpMethod method,
+      String path,
+      Item body,
+      ErrorHandler onError,
+      Consumer<Map<String, String>> responseHeaders) {
     Map<String, String> headers = ImmutableMap.of("Authorization", "Bearer " + BEARER_AUTH_TOKEN);
     switch (method) {
       case POST:
-        return restClient.post(path, body, Item.class, headers, onError);
+        return restClient.post(path, body, Item.class, headers, onError, responseHeaders);
       case GET:
         return restClient.get(path, Item.class, headers, onError);
       case HEAD:
         restClient.head(path, headers, onError);
         return null;
       case DELETE:
-        return restClient.delete(path, Item.class, headers, onError);
+        return restClient.delete(path, Item.class, () -> headers, onError);
       default:
         throw new IllegalArgumentException(String.format("Invalid method: %s", method));
     }

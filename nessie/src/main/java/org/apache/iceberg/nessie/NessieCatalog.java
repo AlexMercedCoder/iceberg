@@ -22,6 +22,7 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.function.Function;
 import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.conf.Configuration;
@@ -64,6 +65,7 @@ public class NessieCatalog extends BaseMetastoreCatalog
 
   private static final Logger LOG = LoggerFactory.getLogger(NessieCatalog.class);
   private static final Joiner SLASH = Joiner.on("/");
+  private static final String NAMESPACE_LOCATION_PROPS = "location";
   private NessieIcebergClient client;
   private String warehouseLocation;
   private Configuration config;
@@ -199,10 +201,24 @@ public class NessieCatalog extends BaseMetastoreCatalog
 
   @Override
   protected String defaultWarehouseLocation(TableIdentifier table) {
+    String location;
     if (table.hasNamespace()) {
-      return SLASH.join(warehouseLocation, table.namespace().toString(), table.name());
+      String baseLocation = SLASH.join(warehouseLocation, table.namespace().toString());
+      try {
+        baseLocation =
+            loadNamespaceMetadata(table.namespace())
+                .getOrDefault(NAMESPACE_LOCATION_PROPS, baseLocation);
+      } catch (NoSuchNamespaceException e) {
+        // do nothing we want the same behavior that if the location is not defined
+      }
+      location = SLASH.join(baseLocation, table.name());
+    } else {
+      location = SLASH.join(warehouseLocation, table.name());
     }
-    return SLASH.join(warehouseLocation, table.name());
+    // Different tables with same table name can exist across references in Nessie.
+    // To avoid sharing same table path between two tables with same name, use uuid in the table
+    // path.
+    return location + "_" + UUID.randomUUID();
   }
 
   @Override
@@ -255,11 +271,10 @@ public class NessieCatalog extends BaseMetastoreCatalog
   }
 
   /**
-   * Load the given namespace but return an empty map because namespace properties are currently not
-   * supported.
+   * Load the given namespace and return its properties.
    *
    * @param namespace a namespace. {@link Namespace}
-   * @return an empty map
+   * @return a string map of properties for the given namespace
    * @throws NoSuchNamespaceException If the namespace does not exist
    */
   @Override
@@ -323,5 +338,10 @@ public class NessieCatalog extends BaseMetastoreCatalog
       return TableIdentifier.of(identifier.namespace(), tableReference.getName());
     }
     return identifier;
+  }
+
+  @Override
+  protected Map<String, String> properties() {
+    return catalogOptions == null ? ImmutableMap.of() : catalogOptions;
   }
 }

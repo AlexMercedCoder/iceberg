@@ -21,6 +21,7 @@ package org.apache.iceberg.jdbc;
 import static org.apache.iceberg.NullOrder.NULLS_FIRST;
 import static org.apache.iceberg.SortDirection.ASC;
 import static org.apache.iceberg.types.Types.NestedField.required;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.io.File;
 import java.io.IOException;
@@ -31,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.hadoop.conf.Configuration;
@@ -40,12 +42,15 @@ import org.apache.iceberg.AssertHelpers;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableOperations;
+import org.apache.iceberg.TestHelpers;
 import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.CatalogTests;
 import org.apache.iceberg.catalog.Namespace;
@@ -55,6 +60,9 @@ import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.hadoop.Util;
+import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.metrics.MetricsReport;
+import org.apache.iceberg.metrics.MetricsReporter;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -117,6 +125,10 @@ public class TestJdbcCatalog extends CatalogTests<JdbcCatalog> {
 
   @BeforeEach
   public void setupTable() throws Exception {
+    catalog = initCatalog("test_jdbc_catalog", Maps.newHashMap());
+  }
+
+  private JdbcCatalog initCatalog(String catalogName, Map<String, String> props) {
     Map<String, String> properties = Maps.newHashMap();
     properties.put(
         CatalogProperties.URI,
@@ -126,9 +138,12 @@ public class TestJdbcCatalog extends CatalogTests<JdbcCatalog> {
     properties.put(JdbcCatalog.PROPERTY_PREFIX + "password", "password");
     warehouseLocation = this.tableDir.toAbsolutePath().toString();
     properties.put(CatalogProperties.WAREHOUSE_LOCATION, warehouseLocation);
-    catalog = new JdbcCatalog();
-    catalog.setConf(conf);
-    catalog.initialize("test_jdbc_catalog", properties);
+    properties.putAll(props);
+
+    JdbcCatalog jdbcCatalog = new JdbcCatalog();
+    jdbcCatalog.setConf(conf);
+    jdbcCatalog.initialize(catalogName, properties);
+    return jdbcCatalog;
   }
 
   @Test
@@ -249,7 +264,7 @@ public class TestJdbcCatalog extends CatalogTests<JdbcCatalog> {
     Assert.assertEquals("Direction must match ", ASC, sortOrder.fields().get(0).direction());
     Assert.assertEquals(
         "Null order must match ", NULLS_FIRST, sortOrder.fields().get(0).nullOrder());
-    Transform<?, ?> transform = Transforms.identity(Types.IntegerType.get());
+    Transform<?, ?> transform = Transforms.identity();
     Assert.assertEquals("Transform must match", transform, sortOrder.fields().get(0).transform());
   }
 
@@ -385,6 +400,19 @@ public class TestJdbcCatalog extends CatalogTests<JdbcCatalog> {
         () -> catalog.listTables(testTable2.namespace()));
 
     Assert.assertFalse(catalog.dropTable(TableIdentifier.of("db", "tbl-not-exists")));
+  }
+
+  @Test
+  public void testDropTableWithoutMetadataFile() {
+    TableIdentifier testTable = TableIdentifier.of("db", "ns1", "ns2", "tbl");
+    catalog.createTable(testTable, SCHEMA, PartitionSpec.unpartitioned());
+    String metadataFileLocation = catalog.newTableOps(testTable).current().metadataFileLocation();
+    TableOperations ops = catalog.newTableOps(testTable);
+    ops.io().deleteFile(metadataFileLocation);
+    Assert.assertTrue(catalog.dropTable(testTable));
+    assertThatThrownBy(() -> catalog.loadTable(testTable))
+        .isInstanceOf(NoSuchTableException.class)
+        .hasMessageContaining("Table does not exist:");
   }
 
   @Test
@@ -600,9 +628,48 @@ public class TestJdbcCatalog extends CatalogTests<JdbcCatalog> {
   @Test
   public void testCreateNamespace() {
     Namespace testNamespace = Namespace.of("testDb", "ns1", "ns2");
+    Assert.assertFalse(catalog.namespaceExists(testNamespace));
     // Test with no metadata
     catalog.createNamespace(testNamespace);
     Assert.assertTrue(catalog.namespaceExists(testNamespace));
+  }
+
+  @Test
+  public void testCreateTableInNonExistingNamespace() {
+    try (JdbcCatalog jdbcCatalog = initCatalog("non_strict_jdbc_catalog", ImmutableMap.of())) {
+      Namespace namespace = Namespace.of("testDb", "ns1", "ns2");
+      TableIdentifier identifier = TableIdentifier.of(namespace, "someTable");
+      Assertions.assertThat(jdbcCatalog.namespaceExists(namespace)).isFalse();
+      Assertions.assertThat(jdbcCatalog.tableExists(identifier)).isFalse();
+
+      // default=non-strict mode allows creating a table in a non-existing namespace
+      jdbcCatalog.createTable(identifier, SCHEMA, PARTITION_SPEC);
+      Assertions.assertThat(jdbcCatalog.loadTable(identifier)).isNotNull();
+    }
+  }
+
+  @Test
+  public void testCreateTableInNonExistingNamespaceStrictMode() {
+    try (JdbcCatalog jdbcCatalog =
+        initCatalog(
+            "strict_jdbc_catalog", ImmutableMap.of(JdbcUtil.STRICT_MODE_PROPERTY, "true"))) {
+      Namespace namespace = Namespace.of("testDb", "ns1", "ns2");
+      TableIdentifier identifier = TableIdentifier.of(namespace, "someTable");
+      Assertions.assertThat(jdbcCatalog.namespaceExists(namespace)).isFalse();
+      Assertions.assertThat(jdbcCatalog.tableExists(identifier)).isFalse();
+      Assertions.assertThatThrownBy(
+              () -> jdbcCatalog.createTable(identifier, SCHEMA, PARTITION_SPEC))
+          .isInstanceOf(NoSuchNamespaceException.class)
+          .hasMessage(
+              "Cannot create table testDb.ns1.ns2.someTable in catalog strict_jdbc_catalog. Namespace testDb.ns1.ns2 does not exist");
+
+      Assertions.assertThat(jdbcCatalog.tableExists(identifier)).isFalse();
+
+      jdbcCatalog.createNamespace(namespace);
+      Assertions.assertThat(jdbcCatalog.tableExists(identifier)).isFalse();
+      jdbcCatalog.createTable(identifier, SCHEMA, PARTITION_SPEC);
+      Assertions.assertThat(jdbcCatalog.loadTable(identifier)).isNotNull();
+    }
   }
 
   @Test
@@ -614,6 +681,30 @@ public class TestJdbcCatalog extends CatalogTests<JdbcCatalog> {
         ImmutableMap.of("key_1", "value_1", "key_2", "value_2", "key_3", "value_3");
     catalog.createNamespace(testNamespace, testMetadata);
     Assert.assertTrue(catalog.namespaceExists(testNamespace));
+  }
+
+  @Test
+  public void testNamespaceLocation() {
+    Namespace testNamespace = Namespace.of("testDb", "ns1", "ns2");
+
+    // Test with location
+    Map<String, String> testMetadata = ImmutableMap.of();
+    catalog.createNamespace(testNamespace, testMetadata);
+
+    Assertions.assertThat(catalog.loadNamespaceMetadata(testNamespace)).containsKey("location");
+  }
+
+  @Test
+  public void testNamespaceCustomLocation() {
+    Namespace testNamespace = Namespace.of("testDb", "ns1", "ns2");
+    String namespaceLocation = "file:///tmp/warehouse/ns/path";
+
+    // Test with location
+    Map<String, String> testMetadata = ImmutableMap.of("location", namespaceLocation);
+    catalog.createNamespace(testNamespace, testMetadata);
+
+    Assertions.assertThat(catalog.loadNamespaceMetadata(testNamespace).get("location"))
+        .isEqualTo(namespaceLocation);
   }
 
   @Test
@@ -694,7 +785,12 @@ public class TestJdbcCatalog extends CatalogTests<JdbcCatalog> {
     catalog.dropTable(identifier, false);
     TableOperations ops = ((HasTableOperations) registeringTable).operations();
     String metadataLocation = ((JdbcTableOperations) ops).currentMetadataLocation();
-    Assertions.assertThat(catalog.registerTable(identifier, metadataLocation)).isNotNull();
+    Table registeredTable = catalog.registerTable(identifier, metadataLocation);
+    Assertions.assertThat(registeredTable).isNotNull();
+    TestHelpers.assertSerializedAndLoadedMetadata(registeringTable, registeredTable);
+    String expectedMetadataLocation =
+        ((HasTableOperations) registeredTable).operations().current().metadataFileLocation();
+    Assertions.assertThat(metadataLocation).isEqualTo(expectedMetadataLocation);
     Assertions.assertThat(catalog.loadTable(identifier)).isNotNull();
     Assertions.assertThat(catalog.dropTable(identifier)).isTrue();
   }
@@ -710,5 +806,44 @@ public class TestJdbcCatalog extends CatalogTests<JdbcCatalog> {
         .isInstanceOf(AlreadyExistsException.class)
         .hasMessage("Table already exists: a.t1");
     Assertions.assertThat(catalog.dropTable(identifier)).isTrue();
+  }
+
+  @Test
+  public void testCatalogWithCustomMetricsReporter() throws IOException {
+    JdbcCatalog catalogWithCustomReporter =
+        initCatalog(
+            "test_jdbc_catalog_with_custom_reporter",
+            ImmutableMap.of(
+                CatalogProperties.METRICS_REPORTER_IMPL, CustomMetricsReporter.class.getName()));
+    try {
+      catalogWithCustomReporter.buildTable(TABLE, SCHEMA).create();
+      Table table = catalogWithCustomReporter.loadTable(TABLE);
+      table
+          .newFastAppend()
+          .appendFile(
+              DataFiles.builder(PartitionSpec.unpartitioned())
+                  .withPath(FileFormat.PARQUET.addExtension(UUID.randomUUID().toString()))
+                  .withFileSizeInBytes(10)
+                  .withRecordCount(2)
+                  .build())
+          .commit();
+      try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+        Assertions.assertThat(tasks.iterator()).hasNext();
+      }
+    } finally {
+      catalogWithCustomReporter.dropTable(TABLE);
+    }
+    // counter of custom metrics reporter should have been increased
+    // 1x for commit metrics / 1x for scan metrics
+    Assertions.assertThat(CustomMetricsReporter.COUNTER.get()).isEqualTo(2);
+  }
+
+  public static class CustomMetricsReporter implements MetricsReporter {
+    static final AtomicInteger COUNTER = new AtomicInteger(0);
+
+    @Override
+    public void report(MetricsReport report) {
+      COUNTER.incrementAndGet();
+    }
   }
 }

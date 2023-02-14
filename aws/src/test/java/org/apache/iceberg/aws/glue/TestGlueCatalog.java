@@ -24,6 +24,7 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.iceberg.AssertHelpers;
 import org.apache.iceberg.BaseMetastoreTableOperations;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.aws.AwsProperties;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -34,6 +35,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.util.LockManagers;
+import org.assertj.core.api.Assertions;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
@@ -50,6 +52,7 @@ import software.amazon.awssdk.services.glue.model.DeleteDatabaseRequest;
 import software.amazon.awssdk.services.glue.model.DeleteDatabaseResponse;
 import software.amazon.awssdk.services.glue.model.DeleteTableRequest;
 import software.amazon.awssdk.services.glue.model.DeleteTableResponse;
+import software.amazon.awssdk.services.glue.model.EntityNotFoundException;
 import software.amazon.awssdk.services.glue.model.GetDatabaseRequest;
 import software.amazon.awssdk.services.glue.model.GetDatabaseResponse;
 import software.amazon.awssdk.services.glue.model.GetDatabasesRequest;
@@ -80,25 +83,33 @@ public class TestGlueCatalog {
         new AwsProperties(),
         glue,
         LockManagers.defaultLockManager(),
-        null);
+        null,
+        ImmutableMap.of());
   }
 
   @Test
   public void testConstructorEmptyWarehousePath() {
-    AssertHelpers.assertThrows(
-        "warehouse path cannot be null",
-        IllegalArgumentException.class,
-        "Cannot initialize GlueCatalog because warehousePath must not be null or empty",
-        () -> {
-          GlueCatalog catalog = new GlueCatalog();
-          catalog.initialize(
-              CATALOG_NAME,
-              null,
-              new AwsProperties(),
-              glue,
-              LockManagers.defaultLockManager(),
-              null);
-        });
+    GlueCatalog catalog = new GlueCatalog();
+    catalog.initialize(
+        CATALOG_NAME,
+        null,
+        new AwsProperties(),
+        glue,
+        LockManagers.defaultLockManager(),
+        null,
+        ImmutableMap.of());
+    Mockito.doReturn(
+            GetDatabaseResponse.builder().database(Database.builder().name("db").build()).build())
+        .when(glue)
+        .getDatabase(Mockito.any(GetDatabaseRequest.class));
+    Mockito.doThrow(EntityNotFoundException.builder().build())
+        .when(glue)
+        .getTable(Mockito.any(GetTableRequest.class));
+    Assertions.assertThatThrownBy(
+            () -> catalog.createTable(TableIdentifier.of("db", "table"), new Schema()))
+        .hasMessageContaining(
+            "Cannot derive default warehouse location, warehouse path must not be null or empty")
+        .isInstanceOf(ValidationException.class);
   }
 
   @Test
@@ -110,7 +121,8 @@ public class TestGlueCatalog {
         new AwsProperties(),
         glue,
         LockManagers.defaultLockManager(),
-        null);
+        null,
+        ImmutableMap.of());
     Mockito.doReturn(
             GetDatabaseResponse.builder().database(Database.builder().name("db").build()).build())
         .when(glue)
@@ -139,6 +151,33 @@ public class TestGlueCatalog {
         .getDatabase(Mockito.any(GetDatabaseRequest.class));
     String location = glueCatalog.defaultWarehouseLocation(TableIdentifier.of("db", "table"));
     Assert.assertEquals("s3://bucket2/db/table", location);
+  }
+
+  @Test
+  public void testDefaultWarehouseLocationCustomCatalogId() {
+    GlueCatalog catalogWithCustomCatalogId = new GlueCatalog();
+    String catalogId = "myCatalogId";
+    AwsProperties awsProperties = new AwsProperties();
+    awsProperties.setGlueCatalogId(catalogId);
+    catalogWithCustomCatalogId.initialize(
+        CATALOG_NAME,
+        WAREHOUSE_PATH + "/",
+        awsProperties,
+        glue,
+        LockManagers.defaultLockManager(),
+        null,
+        ImmutableMap.of());
+
+    Mockito.doReturn(
+            GetDatabaseResponse.builder()
+                .database(Database.builder().name("db").locationUri("s3://bucket2/db").build())
+                .build())
+        .when(glue)
+        .getDatabase(Mockito.any(GetDatabaseRequest.class));
+    catalogWithCustomCatalogId.defaultWarehouseLocation(TableIdentifier.of("db", "table"));
+    Mockito.verify(glue)
+        .getDatabase(
+            Mockito.argThat((GetDatabaseRequest req) -> req.catalogId().equals(catalogId)));
   }
 
   @Test
@@ -582,7 +621,51 @@ public class TestGlueCatalog {
     AwsProperties props = new AwsProperties();
     props.setGlueCatalogSkipNameValidation(true);
     glueCatalog.initialize(
-        CATALOG_NAME, WAREHOUSE_PATH, props, glue, LockManagers.defaultLockManager(), null);
+        CATALOG_NAME,
+        WAREHOUSE_PATH,
+        props,
+        glue,
+        LockManagers.defaultLockManager(),
+        null,
+        ImmutableMap.of());
     Assert.assertEquals(glueCatalog.isValidIdentifier(TableIdentifier.parse("db-1.a-1")), true);
+  }
+
+  @Test
+  public void testTableLevelS3TagProperties() {
+    Map<String, String> properties =
+        ImmutableMap.of(
+            AwsProperties.S3_WRITE_TABLE_TAG_ENABLED,
+            "true",
+            AwsProperties.S3_WRITE_NAMESPACE_TAG_ENABLED,
+            "true");
+    AwsProperties awsProperties = new AwsProperties(properties);
+    glueCatalog.initialize(
+        CATALOG_NAME,
+        WAREHOUSE_PATH,
+        awsProperties,
+        glue,
+        LockManagers.defaultLockManager(),
+        null,
+        properties);
+    GlueTableOperations glueTableOperations =
+        (GlueTableOperations)
+            glueCatalog.newTableOps(TableIdentifier.of(Namespace.of("db"), "table"));
+    Map<String, String> tableCatalogProperties = glueTableOperations.tableCatalogProperties();
+
+    Assert.assertTrue(
+        tableCatalogProperties.containsKey(
+            AwsProperties.S3_WRITE_TAGS_PREFIX.concat(AwsProperties.S3_TAG_ICEBERG_TABLE)));
+    Assert.assertEquals(
+        "table",
+        tableCatalogProperties.get(
+            AwsProperties.S3_WRITE_TAGS_PREFIX.concat(AwsProperties.S3_TAG_ICEBERG_TABLE)));
+    Assert.assertTrue(
+        tableCatalogProperties.containsKey(
+            AwsProperties.S3_WRITE_TAGS_PREFIX.concat(AwsProperties.S3_TAG_ICEBERG_NAMESPACE)));
+    Assert.assertEquals(
+        "db",
+        tableCatalogProperties.get(
+            AwsProperties.S3_WRITE_TAGS_PREFIX.concat(AwsProperties.S3_TAG_ICEBERG_NAMESPACE)));
   }
 }

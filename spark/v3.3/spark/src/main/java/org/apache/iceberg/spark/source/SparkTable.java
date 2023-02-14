@@ -145,7 +145,15 @@ public class SparkTable
 
   @Override
   public String name() {
-    return icebergTable.toString();
+    return String.format("Iceberg %s", icebergTable.name());
+  }
+
+  public Long snapshotId() {
+    return snapshotId;
+  }
+
+  public SparkTable copyWithSnapshotId(long newSnapshotId) {
+    return new SparkTable(icebergTable, newSnapshotId, refreshEagerly);
   }
 
   private Schema snapshotSchema() {

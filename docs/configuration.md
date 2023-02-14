@@ -39,9 +39,9 @@ Iceberg tables support table properties to configure table behavior, like the de
 | read.split.metadata-target-size   | 33554432 (32 MB)   | Target size when combining metadata input splits       |
 | read.split.planning-lookback      | 10                 | Number of bins to consider when combining input splits |
 | read.split.open-file-cost         | 4194304 (4 MB)     | The estimated cost to open a file, used as a minimum weight when combining splits. |
-| read.parquet.vectorization.enabled| false              | Enables parquet vectorized reads                       |
+| read.parquet.vectorization.enabled| true               | Controls whether Parquet vectorized reads are used     |
 | read.parquet.vectorization.batch-size| 5000            | The batch size for parquet vectorized reads            |
-| read.orc.vectorization.enabled    | false              | Enables orc vectorized reads                           |
+| read.orc.vectorization.enabled    | false              | Controls whether orc vectorized reads are used         |
 | read.orc.vectorization.batch-size | 5000               | The batch size for orc vectorized reads                |
 
 ### Write properties
@@ -64,6 +64,8 @@ Iceberg tables support table properties to configure table behavior, like the de
 | write.orc.block-size-bytes         | 268435456 (256 MB) | Define the default file system block size for ORC files |
 | write.orc.compression-codec        | zlib               | ORC compression codec: zstd, lz4, lzo, zlib, snappy, none |
 | write.orc.compression-strategy     | speed              | ORC compression strategy: speed, compression |
+| write.orc.bloom.filter.columns     | (not set)          | Comma separated list of column names for which a Bloom filter must be created |
+| write.orc.bloom.filter.fpp         | 0.05               | False positive probability for Bloom filter (must > 0.0 and < 1.0) |
 | write.location-provider.impl       | null               | Optional custom implementation for LocationProvider  |
 | write.metadata.compression-codec   | none               | Metadata compression codec; none or gzip           |
 | write.metadata.metrics.default     | truncate(16)       | Default metrics mode for all columns in the table; none, counts, truncate(length), or full |
@@ -72,9 +74,11 @@ Iceberg tables support table properties to configure table behavior, like the de
 | write.delete.target-file-size-bytes| 67108864 (64 MB)   | Controls the size of delete files generated to target about this many bytes |
 | write.distribution-mode            | none               | Defines distribution of write data: __none__: don't shuffle rows; __hash__: hash distribute by partition key ; __range__: range distribute by partition key or sort key if table has an SortOrder |
 | write.delete.distribution-mode     | hash               | Defines distribution of write delete data          |
+| write.update.distribution-mode     | hash               | Defines distribution of write update data          |
+| write.merge.distribution-mode      | none               | Defines distribution of write merge data           |
 | write.wap.enabled                  | false              | Enables write-audit-publish writes |
 | write.summary.partition-limit      | 0                  | Includes partition-level summary stats in snapshot summaries if the changed partition count is less than this limit |
-| write.metadata.delete-after-commit.enabled | false      | Controls whether to delete the oldest version metadata files after commit |
+| write.metadata.delete-after-commit.enabled | false      | Controls whether to delete the oldest **tracked** version metadata files after commit |
 | write.metadata.previous-versions-max       | 100        | The max number of previous version metadata files to keep before deleting after commit |
 | write.spark.fanout.enabled         | false              | Enables the fanout writer in Spark that does not require data to be clustered; uses more memory |
 | write.object-storage.enabled       | false              | Enables the object storage location provider that adds a hash component to file paths |
@@ -102,8 +106,8 @@ Iceberg tables support table properties to configure table behavior, like the de
 | commit.manifest.target-size-bytes  | 8388608 (8 MB)   | Target size when merging manifest files                       |
 | commit.manifest.min-count-to-merge | 100              | Minimum number of manifests to accumulate before merging      |
 | commit.manifest-merge.enabled      | true             | Controls whether to automatically merge manifests on writes   |
-| history.expire.max-snapshot-age-ms | 432000000 (5 days) | Default max age of snapshots to keep while expiring snapshots    |
-| history.expire.min-snapshots-to-keep | 1                | Default min number of snapshots to keep while expiring snapshots |
+| history.expire.max-snapshot-age-ms | 432000000 (5 days) | Default max age of snapshots to keep on the table and all of its branches while expiring snapshots |
+| history.expire.min-snapshots-to-keep | 1                | Default min number of snapshots to keep on the table and all of its branches while expiring snapshots |
 | history.expire.max-ref-age-ms      | `Long.MAX_VALUE` (forever) | For snapshot references except the `main` branch, default max age of snapshot references to keep while expiring snapshots. The `main` branch never expires. |
 
 ### Reserved table properties
@@ -148,24 +152,33 @@ Here are the catalog properties related to locking. They are used by some catalo
 | --------------------------------- | ------------------ | ------------------------------------------------------ |
 | lock-impl                         | null               | a custom implementation of the lock manager, the actual interface depends on the catalog used  |
 | lock.table                        | null               | an auxiliary table for locking, such as in [AWS DynamoDB lock manager](../aws/#dynamodb-for-commit-locking)  |
-| lock.acquire-interval-ms          | 5 seconds          | the interval to wait between each attempt to acquire a lock  |
-| lock.acquire-timeout-ms           | 3 minutes          | the maximum time to try acquiring a lock               |
-| lock.heartbeat-interval-ms        | 3 seconds          | the interval to wait between each heartbeat after acquiring a lock  |
-| lock.heartbeat-timeout-ms         | 15 seconds         | the maximum time without a heartbeat to consider a lock expired  |
+| lock.acquire-interval-ms          | 5000 (5 s)         | the interval to wait between each attempt to acquire a lock  |
+| lock.acquire-timeout-ms           | 180000 (3 min)     | the maximum time to try acquiring a lock               |
+| lock.heartbeat-interval-ms        | 3000 (3 s)         | the interval to wait between each heartbeat after acquiring a lock  |
+| lock.heartbeat-timeout-ms         | 15000 (15 s)       | the maximum time without a heartbeat to consider a lock expired  |
 
 
 ## Hadoop configuration
 
 The following properties from the Hadoop configuration are used by the Hive Metastore connector.
+The HMS table locking is a 2-step process:
+1. Lock Creation: Create lock in HMS and queue for acquisition
+2. Lock Check: Check if lock successfully acquired
 
-| Property                              | Default          | Description                                                                        |
-| ------------------------------------- | ---------------- | ---------------------------------------------------------------------------------- |
-| iceberg.hive.client-pool-size         | 5                | The size of the Hive client pool when tracking tables in HMS                       |
-| iceberg.hive.lock-timeout-ms          | 180000 (3 min)   | Maximum time in milliseconds to acquire a lock                                     |
-| iceberg.hive.lock-check-min-wait-ms   | 50               | Minimum time in milliseconds to check back on the status of lock acquisition       |
-| iceberg.hive.lock-check-max-wait-ms   | 5000             | Maximum time in milliseconds to check back on the status of lock acquisition       |
+| Property                                  | Default         | Description                                                                  |
+|-------------------------------------------|-----------------|------------------------------------------------------------------------------|
+| iceberg.hive.client-pool-size             | 5               | The size of the Hive client pool when tracking tables in HMS                 |
+| iceberg.hive.lock-creation-timeout-ms     | 180000 (3 min)  | Maximum time in milliseconds to create a lock in the HMS                     |
+| iceberg.hive.lock-creation-min-wait-ms    | 50              | Minimum time in milliseconds between retries of creating the lock in the HMS |
+| iceberg.hive.lock-creation-max-wait-ms    | 5000            | Maximum time in milliseconds between retries of creating the lock in the HMS |
+| iceberg.hive.lock-timeout-ms              | 180000 (3 min)  | Maximum time in milliseconds to acquire a lock                               |
+| iceberg.hive.lock-check-min-wait-ms       | 50              | Minimum time in milliseconds between checking the acquisition of the lock    |
+| iceberg.hive.lock-check-max-wait-ms       | 5000            | Maximum time in milliseconds between checking the acquisition of the lock    |
+| iceberg.hive.lock-heartbeat-interval-ms   | 240000 (4 min)  | The heartbeat interval for the HMS locks.                                    |
+| iceberg.hive.metadata-refresh-max-retries | 2               | Maximum number of retries when the metadata file is missing                  |
+| iceberg.hive.table-level-lock-evict-ms    | 600000 (10 min) | The timeout for the JVM table lock is                                        |
 
-Note: `iceberg.hive.lock-check-max-wait-ms` should be less than the [transaction timeout](https://cwiki.apache.org/confluence/display/Hive/Configuration+Properties#ConfigurationProperties-hive.txn.timeout) 
+Note: `iceberg.hive.lock-check-max-wait-ms` and `iceberg.hive.lock-heartbeat-interval-ms` should be less than the [transaction timeout](https://cwiki.apache.org/confluence/display/Hive/Configuration+Properties#ConfigurationProperties-hive.txn.timeout) 
 of the Hive Metastore (`hive.txn.timeout` or `metastore.txn.timeout` in the newer versions). Otherwise, the heartbeats on the lock (which happens during the lock checks) would end up expiring in the 
 Hive Metastore before the lock is retried from Iceberg.
 
