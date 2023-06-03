@@ -18,8 +18,8 @@
  */
 package org.apache.iceberg.view;
 
-import edu.umd.cs.findbugs.annotations.Nullable;
 import java.util.List;
+import javax.annotation.Nullable;
 import org.apache.iceberg.catalog.Namespace;
 import org.immutables.value.Value;
 
@@ -44,13 +44,6 @@ public interface SQLViewRepresentation extends ViewRepresentation {
   /** The default namespace when the view is created. */
   @Nullable
   Namespace defaultNamespace();
-
-  /**
-   * The query output schema ID at version create time, without aliases or null if no schema is
-   * defined
-   */
-  @Nullable
-  Integer schemaId();
 
   /** The view field comments. */
   List<String> fieldComments();

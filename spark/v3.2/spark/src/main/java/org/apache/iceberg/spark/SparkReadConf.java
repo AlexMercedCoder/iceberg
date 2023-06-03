@@ -58,7 +58,7 @@ public class SparkReadConf {
   }
 
   public boolean caseSensitive() {
-    return Boolean.parseBoolean(spark.conf().get("spark.sql.caseSensitive"));
+    return SparkUtil.caseSensitive(spark);
   }
 
   public boolean localityEnabled() {
@@ -201,7 +201,7 @@ public class SparkReadConf {
         .parse();
   }
 
-  public Long streamFromTimestamp() {
+  public long streamFromTimestamp() {
     return confParser
         .longConf()
         .option(SparkReadOptions.STREAM_FROM_TIMESTAMP)

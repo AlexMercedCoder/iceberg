@@ -1,3 +1,8 @@
+---
+hide:
+  - navigation
+---
+
 <!--
   - Licensed to the Apache Software Foundation (ASF) under one
   - or more contributor license agreements.  See the NOTICE file
@@ -19,7 +24,7 @@
 
 # Python API
 
-PyIceberg is based around catalogs to load tables. First step is to instantiate a catalog that loads tables. Let's use the following configuration:
+PyIceberg is based around catalogs to load tables. First step is to instantiate a catalog that loads tables. Let's use the following configuration to define a catalog called `prod`:
 
 ```yaml
 catalog:
@@ -27,6 +32,10 @@ catalog:
     uri: http://rest-catalog/ws/
     credential: t-1234:secret
 ```
+
+This information must be placed inside a file called `.pyiceberg.yaml` located either in the `$HOME` or `%USERPROFILE%` directory (depending on whether the operating system is Unix-based or Windows-based, respectively) or in the `$PYICEBERG_HOME` directory (if the corresponding environment variable is set).
+
+For more details on possible configurations refer to the [specific page](https://py.iceberg.apache.org/configuration/).
 
 Then load the `prod` catalog:
 
@@ -277,7 +286,7 @@ Table(
 
 ## Query a table
 
-To query a table, a table scan is needed. A table scan accepts a filter, columns and optionally a snapshot ID:
+To query a table, a table scan is needed. A table scan accepts a filter, columns and optionally a limit and a snapshot ID:
 
 ```python
 from pyiceberg.catalog import load_catalog
@@ -289,6 +298,7 @@ table = catalog.load_table("nyc.taxis")
 scan = table.scan(
     row_filter=GreaterThanOrEqual("trip_distance", 10.0),
     selected_fields=("VendorID", "tpep_pickup_datetime", "tpep_dropoff_datetime"),
+    limit=100,
 )
 
 # Or filter using a string predicate
@@ -302,15 +312,21 @@ scan = table.scan(
 The low level API `plan_files` methods returns a set of tasks that provide the files that might contain matching rows:
 
 ```json
-['s3a://warehouse/wh/nyc/taxis/data/00003-4-42464649-92dd-41ad-b83b-dea1a2fe4b58-00001.parquet']
+[
+  "s3a://warehouse/wh/nyc/taxis/data/00003-4-42464649-92dd-41ad-b83b-dea1a2fe4b58-00001.parquet"
+]
 ```
 
 In this case it is up to the engine itself to filter the file itself. Below, `to_arrow()` and `to_duckdb()` that already do this for you.
 
 ### Apache Arrow
 
+<!-- prettier-ignore-start -->
+
 !!! note "Requirements"
-    This requires [PyArrow to be installed](index.md)
+    This requires [PyArrow to be installed](index.md).
+
+<!-- prettier-ignore-end -->
 
 Using PyIceberg it is filter out data from a huge table and pull it into a PyArrow table:
 
@@ -338,8 +354,12 @@ This will only pull in the files that that might contain matching rows.
 
 ### DuckDB
 
+<!-- prettier-ignore-start -->
+
 !!! note "Requirements"
     This requires [DuckDB to be installed](index.md).
+
+<!-- prettier-ignore-end -->
 
 A table scan can also be converted into a in-memory DuckDB table:
 
@@ -363,5 +383,57 @@ print(
     (datetime.timedelta(seconds=1118),),
     (datetime.timedelta(seconds=1697),),
     (datetime.timedelta(seconds=1581),),
+]
+```
+
+### Ray
+
+<!-- prettier-ignore-start -->
+
+!!! note "Requirements"
+    This requires [Ray to be installed](index.md).
+
+<!-- prettier-ignore-end -->
+
+A table scan can also be converted into a Ray dataset:
+
+```python
+ray_dataset = table.scan(
+    row_filter=GreaterThanOrEqual("trip_distance", 10.0),
+    selected_fields=("VendorID", "tpep_pickup_datetime", "tpep_dropoff_datetime"),
+).to_ray()
+```
+
+This will return a Ray dataset:
+
+```
+Dataset(
+    num_blocks=1,
+    num_rows=1168798,
+    schema={
+        VendorID: int64,
+        tpep_pickup_datetime: timestamp[us, tz=UTC],
+        tpep_dropoff_datetime: timestamp[us, tz=UTC]
+    }
+)
+```
+
+Using [Ray Dataset API](https://docs.ray.io/en/latest/data/api/dataset.html) to interact with the dataset:
+
+```python
+print(
+    ray_dataset.take(2)
+)
+[
+    {
+        'VendorID': 2,
+        'tpep_pickup_datetime': datetime.datetime(2008, 12, 31, 23, 23, 50, tzinfo=<UTC>),
+        'tpep_dropoff_datetime': datetime.datetime(2009, 1, 1, 0, 34, 31, tzinfo=<UTC>)
+    },
+    {
+        'VendorID': 2,
+        'tpep_pickup_datetime': datetime.datetime(2008, 12, 31, 23, 5, 3, tzinfo=<UTC>),
+        'tpep_dropoff_datetime': datetime.datetime(2009, 1, 1, 16, 10, 18, tzinfo=<UTC>)
+    }
 ]
 ```

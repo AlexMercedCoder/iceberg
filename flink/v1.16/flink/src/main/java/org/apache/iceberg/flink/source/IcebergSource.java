@@ -187,7 +187,7 @@ public class IcebergSource<T> implements Source<T, IcebergSourceSplit, IcebergEn
 
     if (scanContext.isStreaming()) {
       ContinuousSplitPlanner splitPlanner =
-          new ContinuousSplitPlannerImpl(lazyTable(), scanContext, planningThreadName());
+          new ContinuousSplitPlannerImpl(tableLoader.clone(), scanContext, planningThreadName());
       return new ContinuousIcebergEnumerator(
           enumContext, assigner, scanContext, splitPlanner, enumState);
     } else {
@@ -224,7 +224,7 @@ public class IcebergSource<T> implements Source<T, IcebergSourceSplit, IcebergEn
       return this;
     }
 
-    public Builder table(Table newTable) {
+    public Builder<T> table(Table newTable) {
       this.table = newTable;
       return this;
     }
@@ -391,6 +391,13 @@ public class IcebergSource<T> implements Source<T, IcebergSourceSplit, IcebergEn
       return this;
     }
 
+    public Builder<T> maxAllowedPlanningFailures(int maxAllowedPlanningFailures) {
+      readOptions.put(
+          FlinkReadOptions.MAX_ALLOWED_PLANNING_FAILURES_OPTION.key(),
+          Integer.toString(maxAllowedPlanningFailures));
+      return this;
+    }
+
     /**
      * Set the read properties for Flink source. View the supported properties in {@link
      * FlinkReadOptions}
@@ -449,7 +456,8 @@ public class IcebergSource<T> implements Source<T, IcebergSourceSplit, IcebergEn
                   context.nameMapping(),
                   context.caseSensitive(),
                   table.io(),
-                  table.encryption());
+                  table.encryption(),
+                  context.filters());
           this.readerFunction = (ReaderFunction<T>) rowDataReaderFunction;
         }
       }
